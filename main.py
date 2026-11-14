@@ -9,8 +9,12 @@ One file, Python 3.13 standard library only, no git binary. Sections:
   4. REST v3: root/meta, repositories, git refs, branches, commits, contents
   5. REST v3: labels, issues, comments
   5b. REST v3: pull requests (create/list/get/files/merge over the odb)
-  6. Stubs for the later builders: GraphQL v4 (/api/graphql), MCP (/mcp);
-     git smart HTTP (/<o>/<r>.git/...) lives in its own sections below
+  5c. Relay global ids, shared by every surface (the pull merge core
+     itself stays with the pulls section, 5b)
+  5d. GraphQL v4 (/api/graphql): a small executor over the same store
+  5e. MCP (/mcp): JSON-RPC tools over the same store
+  6. Router and the HTTP handler; git smart HTTP (/<o>/<r>.git/...)
+     lives in its own sections below
   7. The trial lifecycle (register, /done polling) and standalone mode
 
 Determinism: no wall clock and no randomness anywhere in a response. Times
@@ -1016,19 +1020,26 @@ def list_pull_files(ctx: Ctx, owner: str, name: str, number: str):
     ctx.send(200, chunk, headers)
 
 
-def merge_pull(ctx: Ctx, owner: str, name: str, number: str):
-    repo = resolve_repo(owner, name)
-    pull = _pull(repo, number)
+def _merge_ready(repo: Repo, pull: Pull):
+    """(base_tip, head_tip, merged snapshot) for an open pull that can
+    merge, or None when it cannot (already merged, not open, unknown
+    tips, or a file-level conflict). Shared by every surface's merge."""
     if pull.merged or pull.state != "open":
-        raise ApiError(405, "Pull Request is not mergeable")
+        return None
     base_tip = repo.branches.get(pull.base_ref, pull.base_sha)
     head_tip = repo.branches.get(pull.head_ref, pull.head_sha)
-    plan = None
-    if base_tip in repo.commits and head_tip in repo.commits:
-        plan = _merge_plan(repo, base_tip, head_tip)
+    if base_tip not in repo.commits or head_tip not in repo.commits:
+        return None
+    plan = _merge_plan(repo, base_tip, head_tip)
     if plan is None:
-        raise ApiError(405, "Pull Request is not mergeable")
-    _base_sha, merged_files = plan
+        return None
+    return base_tip, head_tip, plan[1]
+
+
+def _apply_merge(repo: Repo, pull: Pull, base_tip: str, head_tip: str,
+                 merged_files: dict) -> str:
+    """Write the real two-parent merge commit, advance the base branch
+    and mark the pull merged. Returns the merge commit sha."""
     message = (f"Merge pull request #{pull.number} from {pull.head_ref}"
                f"\n\n{pull.title}")
     tick = STORE.tick()
@@ -1045,12 +1056,1342 @@ def merge_pull(ctx: Ctx, owner: str, name: str, number: str):
     pull.state = "closed"
     pull.closed_tick = tick
     pull.updated_tick = tick
+    return sha
+
+
+def merge_pull(ctx: Ctx, owner: str, name: str, number: str):
+    repo = resolve_repo(owner, name)
+    pull = _pull(repo, number)
+    ready = _merge_ready(repo, pull)
+    if ready is None:
+        raise ApiError(405, "Pull Request is not mergeable")
+    base_tip, head_tip, merged_files = ready
+    sha = _apply_merge(repo, pull, base_tip, head_tip, merged_files)
     ctx.send(200, {"sha": sha, "merged": True,
                    "message": "Pull Request successfully merged"})
 
 
 # ---------------------------------------------------------------------------
-# 6. Router, stubs for the later builders, and the HTTP handler
+# 5c. Shared surface operations: Relay global ids
+# ---------------------------------------------------------------------------
+
+
+def gql_global_id(prefix: str, db_id: int) -> str:
+    """The opaque Relay global id for one object: base64 of its REST
+    node_id ('R_7', 'I_12', ...). Opaque, stable across reads, and never
+    the plain database id — the properties the GraphQL checks demand."""
+    return base64.b64encode(f"{prefix}{db_id}".encode()).decode()
+
+
+def gql_parse_global_id(text):
+    """(prefix, db id) out of a global id, or None when it is not one."""
+    if not isinstance(text, str):
+        return None
+    try:
+        raw = base64.b64decode(text + "=" * (-len(text) % 4)).decode()
+    except Exception:
+        return None
+    head, sep, tail = raw.rpartition("_")
+    if not sep or not tail.isdigit():
+        return None
+    return head + "_", int(tail)
+
+
+def find_by_global_id(text):
+    """Locate one object by global id across every repository.
+
+    Returns (typename, repo, obj) — obj is a Repo, Issue, Pull or
+    Comment — or None. Users resolve to ('User', None, None)."""
+    parsed = gql_parse_global_id(text)
+    if parsed is None:
+        return None
+    prefix, db_id = parsed
+    if prefix == "U_":
+        return ("User", None, None) if db_id == 1 else None
+    for repo in STORE.repos.values():
+        if prefix == "R_" and repo.id == db_id:
+            return ("Repository", repo, repo)
+        if prefix == "I_":
+            for issue in repo.issues.values():
+                if issue.id == db_id:
+                    return ("Issue", repo, issue)
+        if prefix == "PR_":
+            for pull in repo.pulls.values():
+                if pull.id == db_id:
+                    return ("PullRequest", repo, pull)
+        if prefix == "IC_":
+            for issue in repo.issues.values():
+                for comment in issue.comments:
+                    if comment.id == db_id:
+                        return ("IssueComment", repo, comment)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 5d. GraphQL v4: lexer, parser and value resolution
+# ---------------------------------------------------------------------------
+
+
+class GqlError(Exception):
+    """A GraphQL-level failure: answered 200 with an errors array."""
+
+
+class _Var:
+    """A $variable reference inside a parsed value."""
+
+    def __init__(self, name):
+        self.name = name
+
+
+class _Enum(str):
+    """A bare enum literal inside a parsed value."""
+
+
+_GQL_PUNCT = set("!$():=@[]{}|")
+
+
+def _gql_tokens(text: str) -> list:
+    toks = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n,":
+            i += 1
+            continue
+        if ch == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if text.startswith("...", i):
+            toks.append(("spread", "..."))
+            i += 3
+            continue
+        if ch == '"':
+            if text.startswith('"""', i):
+                end = text.find('"""', i + 3)
+                if end < 0:
+                    raise GqlError("Unterminated block string")
+                toks.append(("string", text[i + 3:end]))
+                i = end + 3
+                continue
+            j = i + 1
+            out = []
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    esc = text[j + 1]
+                    if esc == "u" and j + 5 < n:
+                        out.append(chr(int(text[j + 2:j + 6], 16)))
+                        j += 6
+                        continue
+                    out.append({"n": "\n", "t": "\t", "r": "\r", "b": "\b",
+                                "f": "\f", "/": "/", "\\": "\\",
+                                '"': '"'}.get(esc, esc))
+                    j += 2
+                else:
+                    out.append(text[j])
+                    j += 1
+            if j >= n:
+                raise GqlError("Unterminated string")
+            toks.append(("string", "".join(out)))
+            i = j + 1
+            continue
+        if ch.isalpha() or ch == "_":
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            toks.append(("name", text[i:j]))
+            i = j
+            continue
+        if ch.isdigit() or (ch == "-" and i + 1 < n
+                            and text[i + 1].isdigit()):
+            j = i + 1
+            while j < n and (text[j].isdigit() or text[j] in ".eE+-"):
+                j += 1
+            num = text[i:j]
+            try:
+                value = float(num) if any(c in num for c in ".eE") \
+                    else int(num)
+            except ValueError:
+                raise GqlError(f"Invalid number {num!r}")
+            toks.append(("number", value))
+            i = j
+            continue
+        if ch in _GQL_PUNCT:
+            toks.append((ch, ch))
+            i += 1
+            continue
+        raise GqlError(f"Unexpected character {ch!r}")
+    toks.append(("eof", None))
+    return toks
+
+
+class _GqlParser:
+    """A recursive-descent parser for the GraphQL documents gh and
+    github-mcp-server send: operations with variable definitions,
+    aliases, arguments (variables, enum lists, input objects, null),
+    fragments and inline fragments, directives skipped."""
+
+    def __init__(self, text: str):
+        self.toks = _gql_tokens(text)
+        self.pos = 0
+
+    def peek(self):
+        return self.toks[self.pos]
+
+    def next(self):
+        tok = self.toks[self.pos]
+        self.pos += 1
+        return tok
+
+    def expect(self, kind: str):
+        tok = self.next()
+        if tok[0] != kind:
+            raise GqlError(f"Expected {kind}, found {tok[1]!r}")
+        return tok
+
+    def parse_document(self):
+        ops, frags = [], {}
+        while self.peek()[0] != "eof":
+            kind, val = self.peek()
+            if kind == "{":
+                ops.append({"op": "query", "name": None, "vardefs": {},
+                            "sels": self.parse_selection_set()})
+            elif kind == "name" and val in ("query", "mutation",
+                                            "subscription"):
+                self.next()
+                name = self.next()[1] if self.peek()[0] == "name" else None
+                vardefs = {}
+                if self.peek()[0] == "(":
+                    vardefs = self.parse_var_defs()
+                self.skip_directives()
+                ops.append({"op": val, "name": name, "vardefs": vardefs,
+                            "sels": self.parse_selection_set()})
+            elif kind == "name" and val == "fragment":
+                self.next()
+                fname = self.expect("name")[1]
+                self.expect("name")     # the word 'on'
+                tname = self.expect("name")[1]
+                self.skip_directives()
+                frags[fname] = {"type": tname,
+                                "sels": self.parse_selection_set()}
+            else:
+                raise GqlError(f"Unexpected token {val!r}")
+        return ops, frags
+
+    def parse_var_defs(self):
+        defs = {}
+        self.expect("(")
+        while self.peek()[0] != ")":
+            self.expect("$")
+            name = self.expect("name")[1]
+            self.expect(":")
+            self.parse_type()
+            default = None
+            if self.peek()[0] == "=":
+                self.next()
+                default = self.parse_value()
+            self.skip_directives()
+            defs[name] = default
+        self.expect(")")
+        return defs
+
+    def parse_type(self):
+        if self.peek()[0] == "[":
+            self.next()
+            self.parse_type()
+            self.expect("]")
+        else:
+            self.expect("name")
+        if self.peek()[0] == "!":
+            self.next()
+
+    def skip_directives(self):
+        while self.peek()[0] == "@":
+            self.next()
+            self.expect("name")
+            if self.peek()[0] == "(":
+                self.parse_arguments()
+
+    def parse_arguments(self):
+        args = {}
+        self.expect("(")
+        while self.peek()[0] != ")":
+            name = self.expect("name")[1]
+            self.expect(":")
+            args[name] = self.parse_value()
+        self.expect(")")
+        return args
+
+    def parse_value(self):
+        kind, val = self.peek()
+        if kind == "$":
+            self.next()
+            return _Var(self.expect("name")[1])
+        if kind in ("string", "number"):
+            self.next()
+            return val
+        if kind == "name":
+            self.next()
+            if val == "true":
+                return True
+            if val == "false":
+                return False
+            if val == "null":
+                return None
+            return _Enum(val)
+        if kind == "[":
+            self.next()
+            items = []
+            while self.peek()[0] != "]":
+                items.append(self.parse_value())
+            self.expect("]")
+            return items
+        if kind == "{":
+            self.next()
+            obj = {}
+            while self.peek()[0] != "}":
+                key = self.expect("name")[1]
+                self.expect(":")
+                obj[key] = self.parse_value()
+            self.expect("}")
+            return obj
+        raise GqlError(f"Unexpected value token {val!r}")
+
+    def parse_selection_set(self):
+        sels = []
+        self.expect("{")
+        while self.peek()[0] != "}":
+            kind, val = self.peek()
+            if kind == "spread":
+                self.next()
+                if self.peek()[0] == "name" and self.peek()[1] == "on":
+                    self.next()
+                    tname = self.expect("name")[1]
+                    self.skip_directives()
+                    sels.append({"kind": "inline", "type": tname,
+                                 "sels": self.parse_selection_set()})
+                else:
+                    fname = self.expect("name")[1]
+                    self.skip_directives()
+                    sels.append({"kind": "frag", "name": fname})
+            elif kind == "name":
+                self.next()
+                alias, fname = None, val
+                if self.peek()[0] == ":":
+                    self.next()
+                    alias, fname = val, self.expect("name")[1]
+                args = {}
+                if self.peek()[0] == "(":
+                    args = self.parse_arguments()
+                self.skip_directives()
+                sub = None
+                if self.peek()[0] == "{":
+                    sub = self.parse_selection_set()
+                sels.append({"kind": "field", "alias": alias, "name": fname,
+                             "args": args, "sels": sub})
+            else:
+                raise GqlError(f"Unexpected selection token {val!r}")
+        self.expect("}")
+        return sels
+
+
+def _gql_value(value, variables):
+    """Resolve a parsed argument value against the operation variables."""
+    if isinstance(value, _Var):
+        return variables.get(value.name)
+    if isinstance(value, _Enum):
+        return str(value)
+    if isinstance(value, list):
+        return [_gql_value(item, variables) for item in value]
+    if isinstance(value, dict):
+        return {key: _gql_value(item, variables)
+                for key, item in value.items()}
+    return value
+
+
+# ---------------------------------------------------------------------------
+# 5d (continued). GraphQL schema surface, executor and handler
+# ---------------------------------------------------------------------------
+
+# The field list of every object type the executor serves. It drives
+# both the __type introspection answers (gh's feature-detection probes
+# read these lists) and field validation (an unknown field is a 200
+# with an errors array naming it, never an HTTP error).
+_GQL_TYPE_FIELDS = {
+    "Query": ["viewer", "repository", "node", "rateLimit"],
+    "Mutation": ["createIssue", "closeIssue", "createPullRequest",
+                 "mergePullRequest", "addComment"],
+    "User": ["id", "login", "name", "url"],
+    "Repository": ["id", "databaseId", "name", "nameWithOwner", "owner",
+                   "description", "isPrivate", "defaultBranchRef",
+                   "viewerPermission", "hasIssuesEnabled", "issue",
+                   "issues", "pullRequest", "pullRequests", "createdAt",
+                   "updatedAt", "url"],
+    "Ref": ["name", "prefix", "target"],
+    "Commit": ["id", "oid", "message", "messageHeadline"],
+    "Issue": ["id", "number", "title", "body", "state", "author",
+              "repository", "labels", "comments", "createdAt",
+              "updatedAt", "closedAt", "url"],
+    "IssueConnection": ["nodes", "edges", "pageInfo", "totalCount"],
+    "IssueEdge": ["node", "cursor"],
+    "PullRequest": ["id", "number", "title", "body", "state", "merged",
+                    "mergeable", "headRefName", "baseRefName", "headRef",
+                    "baseRef", "author", "repository", "files",
+                    "additions", "deletions", "changedFiles", "createdAt",
+                    "updatedAt", "closedAt", "mergedAt", "mergeCommit",
+                    "url"],
+    "PullRequestConnection": ["nodes", "edges", "pageInfo",
+                              "totalCount"],
+    "PullRequestEdge": ["node", "cursor"],
+    "PullRequestChangedFile": ["path", "additions", "deletions",
+                               "changeType"],
+    "PullRequestChangedFileConnection": ["nodes", "edges", "pageInfo",
+                                         "totalCount"],
+    "PullRequestChangedFileEdge": ["node", "cursor"],
+    "IssueComment": ["id", "body", "author", "createdAt", "updatedAt"],
+    "IssueCommentConnection": ["nodes", "edges", "pageInfo",
+                               "totalCount"],
+    "IssueCommentEdge": ["node", "cursor"],
+    "Label": ["id", "name", "color", "description"],
+    "LabelConnection": ["nodes", "edges", "pageInfo", "totalCount"],
+    "LabelEdge": ["node", "cursor"],
+    "PageInfo": ["hasNextPage", "hasPreviousPage", "startCursor",
+                 "endCursor"],
+    "CreateIssuePayload": ["clientMutationId", "issue"],
+    "CloseIssuePayload": ["clientMutationId", "issue"],
+    "CreatePullRequestPayload": ["clientMutationId", "pullRequest"],
+    "MergePullRequestPayload": ["clientMutationId", "pullRequest"],
+    "AddCommentPayload": ["clientMutationId", "commentEdge", "subject"],
+    "CommentEdge": ["cursor", "node"],
+    "RateLimit": ["cost", "limit", "remaining", "resetAt", "used"],
+    "__Type": ["kind", "name", "description", "fields", "enumValues",
+               "inputFields", "possibleTypes", "ofType"],
+    "__Field": ["name", "description", "args", "type", "isDeprecated",
+                "deprecationReason"],
+    "__EnumValue": ["name", "description", "isDeprecated",
+                    "deprecationReason"],
+    "__InputValue": ["name", "description", "type", "defaultValue"],
+    "__Schema": ["types", "queryType", "mutationType", "directives"],
+}
+
+_GQL_ENUM_VALUES = {
+    "IssueState": ["OPEN", "CLOSED"],
+    "PullRequestState": ["OPEN", "CLOSED", "MERGED"],
+    "MergeableState": ["MERGEABLE", "CONFLICTING", "UNKNOWN"],
+    "PullRequestMergeMethod": ["MERGE", "SQUASH", "REBASE"],
+    "RepositoryPermission": ["ADMIN", "MAINTAIN", "WRITE", "TRIAGE",
+                             "READ"],
+    "SearchType": ["ISSUE", "REPOSITORY", "USER", "DISCUSSION"],
+    "IssueOrderField": ["CREATED_AT", "UPDATED_AT", "COMMENTS"],
+    "OrderDirection": ["ASC", "DESC"],
+}
+
+_GQL_INPUT_FIELDS = {
+    "CreateIssueInput": ["clientMutationId", "repositoryId", "title",
+                         "body", "labelIds", "assigneeIds"],
+    "CloseIssueInput": ["clientMutationId", "issueId", "stateReason"],
+    "CreatePullRequestInput": ["clientMutationId", "repositoryId",
+                               "baseRefName", "headRefName", "title",
+                               "body", "draft", "maintainerCanModify"],
+    "MergePullRequestInput": ["clientMutationId", "pullRequestId",
+                              "mergeMethod", "commitHeadline",
+                              "commitBody"],
+    "AddCommentInput": ["clientMutationId", "subjectId", "body"],
+}
+
+
+def _gql_known_type(name):
+    return (name in _GQL_TYPE_FIELDS or name in _GQL_ENUM_VALUES
+            or name in _GQL_INPUT_FIELDS)
+
+
+def _viewer_login() -> str:
+    return STORE.viewer_login or "user"
+
+
+def _user_ctx():
+    return {"__type": "User"}
+
+
+def _repo_ctx(repo):
+    return {"__type": "Repository", "repo": repo}
+
+
+def _issue_ctx(repo, issue):
+    return {"__type": "Issue", "repo": repo, "issue": issue}
+
+
+def _pull_ctx(repo, pull):
+    return {"__type": "PullRequest", "repo": repo, "pull": pull}
+
+
+def _comment_ctx(repo, comment):
+    return {"__type": "IssueComment", "repo": repo, "comment": comment}
+
+
+def _gql_cursor(index: int) -> str:
+    return base64.b64encode(f"cursor:{index}".encode()).decode()
+
+
+def _gql_cursor_index(cursor):
+    try:
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+        head, sep, tail = raw.partition(":")
+        if head == "cursor" and sep and tail.isdigit():
+            return int(tail)
+    except Exception:
+        pass
+    return None
+
+
+def _gql_connection(items: list, args: dict, item_type: str,
+                    ctx_fn) -> dict:
+    """One Relay connection over `items` (already in final order):
+    first/after windowing plus the pageInfo the cursor checks read."""
+    first = args.get("first")
+    after = args.get("after")
+    start = 0
+    if isinstance(after, str) and after:
+        index = _gql_cursor_index(after)
+        if index is not None:
+            start = index + 1
+    window = items[start:]
+    if isinstance(first, int) and first >= 0:
+        page = window[:first]
+    else:
+        page = window
+    nodes = [ctx_fn(item) for item in page]
+    edges = [{"__type": f"{item_type}Edge", "node": node,
+              "cursor": _gql_cursor(start + k)}
+             for k, node in enumerate(nodes)]
+    page_info = {
+        "__type": "PageInfo",
+        "hasNextPage": len(window) > len(page),
+        "hasPreviousPage": start > 0,
+        "startCursor": edges[0]["cursor"] if edges else None,
+        "endCursor": edges[-1]["cursor"] if edges else after,
+    }
+    return {"__type": f"{item_type}Connection", "nodes": nodes,
+            "edges": edges, "pageInfo": page_info,
+            "totalCount": len(items)}
+
+
+def _gql_type_ctx(name):
+    return {"__type": "__Type", "name": name}
+
+
+def _gql_field(ctx_type, ctx, name, args, env, errors, path):
+    """Resolve one field on one context. Contexts are dicts carrying
+    '__type' plus their payload; a returned dict is a nested object, a
+    returned list a list of scalars or contexts."""
+    if name == "__typename":
+        return ctx_type
+    valid = _GQL_TYPE_FIELDS.get(ctx_type)
+    if valid is not None and name not in valid and not name.startswith("__"):
+        errors.append({
+            "message": f"Field '{name}' doesn't exist on type "
+                       f"'{ctx_type}'",
+            "path": path,
+        })
+        return None
+    if name == "__type":
+        tname = args.get("name")
+        if isinstance(tname, str) and _gql_known_type(tname):
+            return _gql_type_ctx(tname)
+        return None
+    if name == "__schema":
+        return {"__type": "__Schema"}
+    if ctx_type == "__Type":
+        return _gql_introspect_field(ctx, name)
+    if ctx_type in ("__Field", "__EnumValue", "__InputValue"):
+        if name == "args":
+            return []
+        if name == "type":
+            return None
+        return ctx.get(name)
+    if ctx_type == "__Schema":
+        if name == "types":
+            names = (list(_GQL_TYPE_FIELDS) + list(_GQL_ENUM_VALUES)
+                     + list(_GQL_INPUT_FIELDS))
+            return [_gql_type_ctx(n) for n in names]
+        if name == "queryType":
+            return _gql_type_ctx("Query")
+        if name == "mutationType":
+            return _gql_type_ctx("Mutation")
+        if name == "directives":
+            return []
+        return None
+    handler = _GQL_RESOLVERS.get(ctx_type)
+    if handler is not None:
+        return handler(ctx, name, args, env)
+    if isinstance(ctx, dict):
+        return ctx.get(name)
+    return None
+
+
+def _gql_introspect_field(ctx, name):
+    tname = ctx.get("name")
+    if name == "kind":
+        if tname in _GQL_ENUM_VALUES:
+            return "ENUM"
+        if tname in _GQL_INPUT_FIELDS:
+            return "INPUT_OBJECT"
+        return "OBJECT"
+    if name == "name":
+        return tname
+    if name == "description":
+        return None
+    if name == "fields":
+        fields = _GQL_TYPE_FIELDS.get(tname)
+        if fields is None:
+            return None
+        return [{"__type": "__Field", "name": f, "description": None,
+                 "isDeprecated": False, "deprecationReason": None}
+                for f in fields]
+    if name == "enumValues":
+        values = _GQL_ENUM_VALUES.get(tname)
+        if values is None:
+            return None
+        return [{"__type": "__EnumValue", "name": v, "description": None,
+                 "isDeprecated": False, "deprecationReason": None}
+                for v in values]
+    if name == "inputFields":
+        fields = _GQL_INPUT_FIELDS.get(tname)
+        if fields is None:
+            return None
+        return [{"__type": "__InputValue", "name": f, "description": None,
+                 "defaultValue": None} for f in fields]
+    return None     # possibleTypes / ofType: not modelled
+
+
+def _gql_repo_lookup(owner, name):
+    """The GraphQL repository read: the viewer's repo of that name, or
+    None (data.repository = null, no errors — the unknown-repo check).
+    Learns the viewer login from the owner segment, as REST does."""
+    repo = STORE.repos.get(name) if isinstance(name, str) else None
+    if repo is None:
+        return None
+    if STORE.viewer_login is None and isinstance(owner, str) and owner:
+        STORE.viewer_login = owner
+    if owner != _viewer_login():
+        return None
+    return repo
+
+
+def _resolve_query(ctx, name, args, env):
+    if name == "viewer":
+        return _user_ctx()
+    if name == "repository":
+        repo = _gql_repo_lookup(args.get("owner"), args.get("name"))
+        return _repo_ctx(repo) if repo is not None else None
+    if name == "node":
+        found = find_by_global_id(args.get("id"))
+        if found is None:
+            return None
+        typename, repo, obj = found
+        if typename == "Repository":
+            return _repo_ctx(obj)
+        if typename == "Issue":
+            return _issue_ctx(repo, obj)
+        if typename == "PullRequest":
+            return _pull_ctx(repo, obj)
+        if typename == "IssueComment":
+            return _comment_ctx(repo, obj)
+        return _user_ctx()
+    if name == "rateLimit":
+        return {"__type": "RateLimit", "cost": 1, "limit": 5000,
+                "remaining": 5000, "used": 0,
+                "resetAt": iso_at(STORE.clock + 3600)}
+    return None
+
+
+def _resolve_mutation(ctx, name, args, env):
+    data = args.get("input")
+    if not isinstance(data, dict):
+        raise GqlError(f"{name} requires an input object")
+    if name == "createIssue":
+        found = find_by_global_id(data.get("repositoryId"))
+        if found is None or found[0] != "Repository":
+            raise GqlError("Could not resolve to a Repository with "
+                           f"the id '{data.get('repositoryId')}'")
+        repo = found[2]
+        number = repo.next_number
+        repo.next_number += 1
+        issue = Issue(STORE, number, data.get("title"), data.get("body"),
+                      [])
+        repo.issues[number] = issue
+        return {"__type": "CreateIssuePayload",
+                "clientMutationId": data.get("clientMutationId"),
+                "issue": _issue_ctx(repo, issue)}
+    if name == "closeIssue":
+        found = find_by_global_id(data.get("issueId"))
+        if found is None or found[0] != "Issue":
+            raise GqlError("Could not resolve to an Issue with the id "
+                           f"'{data.get('issueId')}'")
+        repo, issue = found[1], found[2]
+        if issue.state != "closed":
+            issue.state = "closed"
+            issue.closed_tick = STORE.tick()
+        issue.updated_tick = STORE.tick()
+        return {"__type": "CloseIssuePayload",
+                "clientMutationId": data.get("clientMutationId"),
+                "issue": _issue_ctx(repo, issue)}
+    if name == "createPullRequest":
+        found = find_by_global_id(data.get("repositoryId"))
+        if found is None or found[0] != "Repository":
+            raise GqlError("Could not resolve to a Repository with "
+                           f"the id '{data.get('repositoryId')}'")
+        repo = found[2]
+        try:
+            head_ref, head_sha = _resolve_pull_ref(
+                repo, data.get("headRefName"), "head")
+            base_ref, base_sha = _resolve_pull_ref(
+                repo, data.get("baseRefName"), "base")
+        except ApiError as err:
+            raise GqlError(err.message)
+        number = repo.next_number
+        repo.next_number += 1
+        pull = Pull(STORE, number,
+                    data.get("title") if isinstance(data.get("title"), str)
+                    else "",
+                    data.get("body") if isinstance(data.get("body"), str)
+                    else "",
+                    head_ref, head_sha, base_ref, base_sha)
+        repo.pulls[number] = pull
+        return {"__type": "CreatePullRequestPayload",
+                "clientMutationId": data.get("clientMutationId"),
+                "pullRequest": _pull_ctx(repo, pull)}
+    if name == "mergePullRequest":
+        found = find_by_global_id(data.get("pullRequestId"))
+        if found is None or found[0] != "PullRequest":
+            raise GqlError("Could not resolve to a PullRequest with "
+                           f"the id '{data.get('pullRequestId')}'")
+        repo, pull = found[1], found[2]
+        ready = _merge_ready(repo, pull)
+        if ready is None:
+            raise GqlError("Pull Request is not mergeable")
+        _apply_merge(repo, pull, ready[0], ready[1], ready[2])
+        return {"__type": "MergePullRequestPayload",
+                "clientMutationId": data.get("clientMutationId"),
+                "pullRequest": _pull_ctx(repo, pull)}
+    if name == "addComment":
+        found = find_by_global_id(data.get("subjectId"))
+        if found is None or found[0] != "Issue":
+            raise GqlError("Could not resolve to an Issue with the id "
+                           f"'{data.get('subjectId')}'")
+        repo, issue = found[1], found[2]
+        comment = Comment(STORE, data.get("body"))
+        issue.comments.append(comment)
+        return {"__type": "AddCommentPayload",
+                "clientMutationId": data.get("clientMutationId"),
+                "subject": _issue_ctx(repo, issue),
+                "commentEdge": {"__type": "CommentEdge",
+                                "cursor": _gql_cursor(len(issue.comments)
+                                                      - 1),
+                                "node": _comment_ctx(repo, comment)}}
+    return None
+
+
+def _resolve_user(ctx, name, args, env):
+    if name == "id":
+        return gql_global_id("U_", 1)
+    if name == "login":
+        return _viewer_login()
+    if name == "name":
+        return _viewer_login()
+    return None
+
+
+def _resolve_repository(ctx, name, args, env):
+    repo = ctx["repo"]
+    if name == "id":
+        return gql_global_id("R_", repo.id)
+    if name == "databaseId":
+        return repo.id
+    if name == "name":
+        return repo.name
+    if name == "nameWithOwner":
+        return f"{_viewer_login()}/{repo.name}"
+    if name == "owner":
+        return _user_ctx()
+    if name == "description":
+        return repo.description
+    if name == "isPrivate":
+        return repo.private
+    if name == "defaultBranchRef":
+        if repo.default_branch in repo.branches:
+            return {"__type": "Ref", "repo": repo,
+                    "name": repo.default_branch}
+        return None
+    if name == "viewerPermission":
+        return "ADMIN"
+    if name == "hasIssuesEnabled":
+        return True
+    if name == "createdAt":
+        return iso_at(repo.created_tick)
+    if name == "updatedAt":
+        return iso_at(repo.updated_tick)
+    if name == "issue":
+        try:
+            issue = repo.issues.get(int(args.get("number")))
+        except (TypeError, ValueError):
+            issue = None
+        return _issue_ctx(repo, issue) if issue is not None else None
+    if name == "issues":
+        items = list(repo.issues.values())
+        states = args.get("states")
+        if isinstance(states, list) and states:
+            wanted = {str(s).upper() for s in states}
+            items = [i for i in items if i.state.upper() in wanted]
+        order = args.get("orderBy") if isinstance(args.get("orderBy"),
+                                                  dict) else {}
+        field = str(order.get("field", "CREATED_AT")).upper()
+        reverse = str(order.get("direction", "ASC")).upper() == "DESC"
+        keys = {"CREATED_AT": lambda i: i.created_tick,
+                "UPDATED_AT": lambda i: i.updated_tick,
+                "COMMENTS": lambda i: len(i.comments)}
+        items.sort(key=keys.get(field, keys["CREATED_AT"]),
+                   reverse=reverse)
+        return _gql_connection(items, args, "Issue",
+                               lambda i: _issue_ctx(repo, i))
+    if name == "pullRequest":
+        try:
+            pull = repo.pulls.get(int(args.get("number")))
+        except (TypeError, ValueError):
+            pull = None
+        return _pull_ctx(repo, pull) if pull is not None else None
+    if name == "pullRequests":
+        items = sorted(repo.pulls.values(), key=lambda p: p.number)
+        states = args.get("states")
+        if isinstance(states, list) and states:
+            wanted = {str(s).upper() for s in states}
+            items = [p for p in items
+                     if ("MERGED" if p.merged else p.state.upper())
+                     in wanted]
+        return _gql_connection(items, args, "PullRequest",
+                               lambda p: _pull_ctx(repo, p))
+    return None
+
+
+def _resolve_ref(ctx, name, args, env):
+    repo = ctx["repo"]
+    if name == "name":
+        return ctx["name"]
+    if name == "prefix":
+        return "refs/heads/"
+    if name == "target":
+        tip = repo.branches.get(ctx["name"])
+        commit = repo.commits.get(tip) if tip else None
+        if commit is None:
+            return None
+        return {"__type": "Commit", "sha": tip,
+                "message": commit.message}
+    return None
+
+
+def _resolve_commit(ctx, name, args, env):
+    if name == "id":
+        return base64.b64encode(f"C_{ctx['sha']}".encode()).decode()
+    if name == "oid":
+        return ctx["sha"]
+    if name == "message":
+        return ctx["message"]
+    if name == "messageHeadline":
+        return ctx["message"].split("\n")[0]
+    return None
+
+
+def _pull_state(pull) -> str:
+    return "MERGED" if pull.merged else pull.state.upper()
+
+
+def _resolve_pull_request(ctx, name, args, env):
+    repo, pull = ctx["repo"], ctx["pull"]
+    if name == "id":
+        return gql_global_id("PR_", pull.id)
+    if name == "number":
+        return pull.number
+    if name == "title":
+        return pull.title
+    if name == "body":
+        return pull.body if isinstance(pull.body, str) else ""
+    if name == "state":
+        return _pull_state(pull)
+    if name == "merged":
+        return pull.merged
+    if name == "mergeable":
+        flag = pull_mergeable(repo, pull)
+        if flag is None:
+            return "UNKNOWN"
+        return "MERGEABLE" if flag else "CONFLICTING"
+    if name == "headRefName":
+        return pull.head_ref
+    if name == "baseRefName":
+        return pull.base_ref
+    if name == "headRef":
+        if pull.head_ref in repo.branches:
+            return {"__type": "Ref", "repo": repo, "name": pull.head_ref}
+        return None
+    if name == "baseRef":
+        if pull.base_ref in repo.branches:
+            return {"__type": "Ref", "repo": repo, "name": pull.base_ref}
+        return None
+    if name == "author":
+        return _user_ctx()
+    if name == "repository":
+        return _repo_ctx(repo)
+    if name == "files":
+        entries = pull_files(repo, pull)
+        return _gql_connection(
+            entries, args, "PullRequestChangedFile",
+            lambda e: {"__type": "PullRequestChangedFile", "entry": e})
+    if name == "additions":
+        return sum(e["additions"] for e in pull_files(repo, pull))
+    if name == "deletions":
+        return sum(e["deletions"] for e in pull_files(repo, pull))
+    if name == "changedFiles":
+        return len(pull_files(repo, pull))
+    if name == "createdAt":
+        return iso_at(pull.created_tick)
+    if name == "updatedAt":
+        return iso_at(pull.updated_tick)
+    if name == "closedAt":
+        return iso_at(pull.closed_tick) if pull.closed_tick else None
+    if name == "mergedAt":
+        return iso_at(pull.merged_tick) if pull.merged_tick else None
+    if name == "mergeCommit":
+        if pull.merge_commit_sha and pull.merge_commit_sha in repo.commits:
+            commit = repo.commits[pull.merge_commit_sha]
+            return {"__type": "Commit", "sha": pull.merge_commit_sha,
+                    "message": commit.message}
+        return None
+    return None
+
+
+def _resolve_issue(ctx, name, args, env):
+    repo, issue = ctx["repo"], ctx["issue"]
+    if name == "id":
+        return gql_global_id("I_", issue.id)
+    if name == "number":
+        return issue.number
+    if name == "title":
+        return issue.title if isinstance(issue.title, str) else ""
+    if name == "body":
+        return issue.body if isinstance(issue.body, str) else ""
+    if name == "state":
+        return issue.state.upper()
+    if name == "author":
+        return _user_ctx()
+    if name == "repository":
+        return _repo_ctx(repo)
+    if name == "labels":
+        return _gql_connection(
+            issue.labels, args, "Label",
+            lambda lb: {"__type": "Label", "label": lb})
+    if name == "comments":
+        return _gql_connection(issue.comments, args, "IssueComment",
+                               lambda c: _comment_ctx(repo, c))
+    if name == "createdAt":
+        return iso_at(issue.created_tick)
+    if name == "updatedAt":
+        return iso_at(issue.updated_tick)
+    if name == "closedAt":
+        return iso_at(issue.closed_tick) if issue.closed_tick else None
+    return None
+
+
+def _resolve_comment(ctx, name, args, env):
+    comment = ctx["comment"]
+    if name == "id":
+        return gql_global_id("IC_", comment.id)
+    if name == "body":
+        return comment.body if isinstance(comment.body, str) else ""
+    if name == "author":
+        return _user_ctx()
+    if name == "createdAt":
+        return iso_at(comment.created_tick)
+    if name == "updatedAt":
+        return iso_at(comment.updated_tick)
+    return None
+
+
+def _resolve_label(ctx, name, args, env):
+    label = ctx["label"]
+    if name == "id":
+        return gql_global_id("L_", label.id)
+    if name == "name":
+        return label.name
+    if name == "color":
+        return label.color
+    if name == "description":
+        return label.description
+    return None
+
+
+def _resolve_changed_file(ctx, name, args, env):
+    entry = ctx["entry"]
+    if name == "path":
+        return entry["filename"]
+    if name == "additions":
+        return entry["additions"]
+    if name == "deletions":
+        return entry["deletions"]
+    if name == "changeType":
+        return entry["status"].upper()
+    return None
+
+
+_GQL_RESOLVERS = {
+    "Query": _resolve_query,
+    "Mutation": _resolve_mutation,
+    "User": _resolve_user,
+    "Repository": _resolve_repository,
+    "Ref": _resolve_ref,
+    "Commit": _resolve_commit,
+    "Issue": _resolve_issue,
+    "PullRequest": _resolve_pull_request,
+    "IssueComment": _resolve_comment,
+    "Label": _resolve_label,
+    "PullRequestChangedFile": _resolve_changed_file,
+}
+
+
+def _gql_complete(value, sels, env, errors, path):
+    """Shape one resolved value by its selection set: dicts with a
+    '__type' are objects, lists map element-wise, scalars pass."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [_gql_complete(item, sels, env, errors, path)
+                for item in value]
+    if isinstance(value, dict) and sels:
+        return _gql_exec_sels(value.get("__type"), value, sels, env,
+                              errors, path)
+    return value
+
+
+def _gql_exec_sels(ctx_type, ctx, sels, env, errors, path):
+    out = {}
+    for sel in sels:
+        if sel["kind"] == "inline":
+            if sel["type"] == ctx_type:
+                out.update(_gql_exec_sels(ctx_type, ctx, sel["sels"],
+                                          env, errors, path))
+            continue
+        if sel["kind"] == "frag":
+            frag = env["frags"].get(sel["name"])
+            if frag is not None and frag["type"] == ctx_type:
+                out.update(_gql_exec_sels(ctx_type, ctx, frag["sels"],
+                                          env, errors, path))
+            continue
+        key = sel["alias"] or sel["name"]
+        args = {k: _gql_value(v, env["vars"])
+                for k, v in sel["args"].items()}
+        try:
+            value = _gql_field(ctx_type, ctx, sel["name"], args, env,
+                               errors, path + [key])
+        except (GqlError, ApiError) as err:
+            errors.append({"message": str(err), "path": path + [key]})
+            value = None
+        out[key] = _gql_complete(value, sel["sels"], env, errors,
+                                 path + [key])
+    return out
+
+
+def _gql_run(operation):
+    """Execute one operation document; the {data, errors} envelope."""
+    if not isinstance(operation, dict) \
+            or not isinstance(operation.get("query"), str):
+        return {"errors": [{"message": "No GraphQL query document"}]}
+    variables = operation.get("variables")
+    if not isinstance(variables, dict):
+        variables = {}
+    try:
+        ops, frags = _GqlParser(operation["query"]).parse_document()
+    except GqlError as err:
+        return {"errors": [{"message": str(err)}]}
+    if not ops:
+        return {"errors": [{"message": "No operation in the document"}]}
+    chosen = ops[0]
+    op_name = operation.get("operationName")
+    if op_name is not None:
+        for op in ops:
+            if op["name"] == op_name:
+                chosen = op
+                break
+    vars2 = {}
+    for var_name, default in chosen["vardefs"].items():
+        if var_name in variables:
+            vars2[var_name] = variables[var_name]
+        elif default is not None:
+            vars2[var_name] = _gql_value(default, {})
+    for key, value in variables.items():
+        vars2.setdefault(key, value)
+    root = "Mutation" if chosen["op"] == "mutation" else "Query"
+    env = {"vars": vars2, "frags": frags}
+    errors = []
+    data = _gql_exec_sels(root, {"__type": root}, chosen["sels"], env,
+                          errors, [])
+    out = {"data": data}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
+def handle_graphql(ctx: Ctx):
+    """POST /api/graphql: one operation object, or a JSON array of
+    them (GitHub's operation batching) answered in the same order."""
+    raw = read_raw_body(ctx)
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw else None
+    except Exception:
+        return ctx.send(400, {"errors": [
+            {"message": "Problems parsing JSON"}]})
+    if isinstance(payload, list):
+        return ctx.send(200, [_gql_run(op) for op in payload])
+    if isinstance(payload, dict):
+        return ctx.send(200, _gql_run(payload))
+    return ctx.send(400, {"errors": [
+        {"message": "Invalid GraphQL request body"}]})
+
+
+# ---------------------------------------------------------------------------
+# 5e. MCP: JSON-RPC tools over the same store
+# ---------------------------------------------------------------------------
+
+# The legacy handshake era: the client probes server/discover first,
+# reads our -32601 as "pre-discover", and falls back to initialize —
+# the era the rules accept. Every answer is one plain JSON body.
+MCP_PROTOCOL_VERSION = "2025-11-25"
+MCP_SERVER_INFO = {"name": "github-core-clone", "version": "1.0.0"}
+
+
+class McpError(Exception):
+    """A JSON-RPC error: (code, message) answered in the envelope."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _mcp_tools() -> list:
+    """The tool catalogue. Built from literals on every call, so two
+    tools/list answers are byte-identical by construction."""
+    string = {"type": "string"}
+    return [
+        {"name": "create_repo",
+         "description": "Create a new repository for the authenticated "
+                        "user.",
+         "inputSchema": {"type": "object",
+                         "properties": {"name": dict(string),
+                                        "description": dict(string),
+                                        "private": {"type": "boolean"}},
+                         "required": ["name"]}},
+        {"name": "get_repo",
+         "description": "Get a repository by owner and name.",
+         "inputSchema": {"type": "object",
+                         "properties": {"owner": dict(string),
+                                        "repo": dict(string)},
+                         "required": ["owner", "repo"]}},
+        {"name": "create_issue",
+         "description": "Create an issue in a repository.",
+         "inputSchema": {"type": "object",
+                         "properties": {"owner": dict(string),
+                                        "repo": dict(string),
+                                        "title": dict(string),
+                                        "body": dict(string)},
+                         "required": ["owner", "repo", "title"]}},
+        {"name": "list_issues",
+         "description": "List the issues of a repository.",
+         "inputSchema": {"type": "object",
+                         "properties": {"owner": dict(string),
+                                        "repo": dict(string),
+                                        "state": dict(string)},
+                         "required": ["owner", "repo"]}},
+        {"name": "create_pull_request",
+         "description": "Create a pull request in a repository.",
+         "inputSchema": {"type": "object",
+                         "properties": {"owner": dict(string),
+                                        "repo": dict(string),
+                                        "title": dict(string),
+                                        "body": dict(string),
+                                        "head": dict(string),
+                                        "base": dict(string)},
+                         "required": ["owner", "repo", "title", "head",
+                                      "base"]}},
+        {"name": "merge_pull_request",
+         "description": "Merge a pull request by number.",
+         "inputSchema": {"type": "object",
+                         "properties": {"owner": dict(string),
+                                        "repo": dict(string),
+                                        "pull_number": {"type": "integer"}},
+                         "required": ["owner", "repo", "pull_number"]}},
+    ]
+
+
+def _mcp_tool_result(payload, is_error: bool = False) -> dict:
+    """One tools/call result: the object as a JSON text block and as
+    structured content, so a client may read either."""
+    result = {"content": [{"type": "text", "text": json.dumps(payload)}],
+              "structuredContent": payload}
+    if is_error:
+        result["isError"] = True
+    return result
+
+
+def _mcp_call_tool(name, args, base_url: str) -> dict:
+    tools = {tool["name"]: tool for tool in _mcp_tools()}
+    tool = tools.get(name)
+    if tool is None:
+        raise McpError(-32602, f"Unknown tool: {name}")
+    if not isinstance(args, dict):
+        args = {}
+    missing = [key for key in tool["inputSchema"].get("required", [])
+               if args.get(key) is None]
+    if missing:
+        raise McpError(-32602, "Missing required argument(s): "
+                               + ", ".join(missing))
+    try:
+        if name == "create_repo":
+            repo_name = args["name"]
+            if not isinstance(repo_name, str) or not repo_name:
+                raise ApiError(422, "Validation Failed: name is required")
+            if repo_name in STORE.repos:
+                raise ApiError(422, "Validation Failed: name already "
+                                    "exists on this account")
+            repo = Repo(STORE, repo_name, args.get("private", False),
+                        args.get("description"))
+            STORE.repos[repo_name] = repo
+            return _mcp_tool_result(repo.view(base_url))
+        repo = resolve_repo(args.get("owner"), args.get("repo"))
+        if name == "get_repo":
+            return _mcp_tool_result(repo.view(base_url))
+        if name == "create_issue":
+            number = repo.next_number
+            repo.next_number += 1
+            issue = Issue(STORE, number, args.get("title"),
+                          args.get("body"), [])
+            repo.issues[number] = issue
+            return _mcp_tool_result(issue.view(repo))
+        if name == "list_issues":
+            state = args.get("state") or "open"
+            items = [i for i in repo.issues.values()
+                     if state == "all" or i.state == state]
+            items.sort(key=lambda i: i.number)
+            return _mcp_tool_result([i.view(repo) for i in items])
+        if name == "create_pull_request":
+            head_ref, head_sha = _resolve_pull_ref(repo, args.get("head"),
+                                                   "head")
+            base_ref, base_sha = _resolve_pull_ref(repo, args.get("base"),
+                                                   "base")
+            number = repo.next_number
+            repo.next_number += 1
+            pull = Pull(STORE, number,
+                        args.get("title")
+                        if isinstance(args.get("title"), str) else "",
+                        args.get("body")
+                        if isinstance(args.get("body"), str) else "",
+                        head_ref, head_sha, base_ref, base_sha)
+            repo.pulls[number] = pull
+            return _mcp_tool_result(pull.view(repo))
+        if name == "merge_pull_request":
+            pull = _pull(repo, str(args.get("pull_number")))
+            ready = _merge_ready(repo, pull)
+            if ready is None:
+                return _mcp_tool_result(
+                    {"message": "Pull Request is not mergeable"},
+                    is_error=True)
+            sha = _apply_merge(repo, pull, ready[0], ready[1], ready[2])
+            view = pull.view(repo)
+            view["merge_commit_sha"] = sha
+            return _mcp_tool_result(view)
+    except ApiError as err:
+        return _mcp_tool_result({"message": err.message}, is_error=True)
+    raise McpError(-32602, f"Unknown tool: {name}")
+
+
+def _mcp_dispatch(request, base_url: str):
+    """One JSON-RPC request -> (http status, response object or None).
+    A notification (no id) is answered with a bare 202."""
+    if not isinstance(request, dict):
+        return 200, {"jsonrpc": "2.0", "id": None,
+                     "error": {"code": -32600,
+                               "message": "Invalid Request"}}
+    is_notification = "id" not in request
+    rid = request.get("id")
+    method = request.get("method")
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    try:
+        if method == "initialize":
+            offered = params.get("protocolVersion")
+            result = {
+                "protocolVersion": offered
+                if isinstance(offered, str) and offered
+                else MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": dict(MCP_SERVER_INFO),
+            }
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": _mcp_tools()}
+        elif method == "tools/call":
+            result = _mcp_call_tool(params.get("name"),
+                                    params.get("arguments"), base_url)
+        elif isinstance(method, str) and method.startswith("notifications/"):
+            return 202, None
+        else:
+            raise McpError(-32601, f"Method not found: {method}")
+    except McpError as err:
+        if is_notification:
+            return 202, None
+        return 200, {"jsonrpc": "2.0", "id": rid,
+                     "error": {"code": err.code, "message": err.message}}
+    if is_notification:
+        return 202, None
+    return 200, {"jsonrpc": "2.0", "id": rid, "result": result}
+
+
+def handle_mcp(ctx: Ctx):
+    """POST /mcp: JSON-RPC over HTTP, one JSON body per request (a
+    batch array is answered in order). The body is parsed here, not by
+    the REST plumbing, so a malformed body earns the JSON-RPC parse
+    error (-32700, HTTP 400) the protocol demands."""
+    if ctx.method == "DELETE":
+        return ctx.send(200, {})    # no sessions are handed out
+    if ctx.method == "GET":
+        return ctx.send(200, {})    # no server-to-client stream
+    if ctx.method != "POST":
+        raise not_found()
+    raw = read_raw_body(ctx)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return ctx.send(400, {"jsonrpc": "2.0", "id": None,
+                              "error": {"code": -32700,
+                                        "message": "Parse error"}})
+    if not ctx.authed():
+        raise ApiError(401, "Bad credentials")
+    if isinstance(payload, list):
+        responses = []
+        for entry in payload:
+            _status, response = _mcp_dispatch(entry, ctx.base_url)
+            if response is not None:
+                responses.append(response)
+        if not responses:
+            return ctx.send(202)
+        return ctx.send(200, responses)
+    _status, response = _mcp_dispatch(payload, ctx.base_url)
+    if response is None:
+        return ctx.send(202)
+    return ctx.send(200, response)
+
+
+# ---------------------------------------------------------------------------
+# 6. Router and the HTTP handler
 # ---------------------------------------------------------------------------
 
 
@@ -1151,16 +2492,23 @@ def dispatch(ctx: Ctx):
         # Git smart HTTP bodies are binary pkt-lines, never JSON: route
         # before load_body() gets a chance to reject them.
         return route_git(ctx, segments[0], segments[1][:-4], segments[2:])
+    if segments == ["mcp"]:
+        # MCP parses its own body: a malformed one must earn the
+        # JSON-RPC parse error, not the REST "Problems parsing JSON".
+        return handle_mcp(ctx)
+    if segments == ["api", "graphql"] and ctx.method == "POST":
+        # GraphQL bodies may be a JSON array (operation batching),
+        # which load_body() would flatten away; handle_graphql reads
+        # the raw body itself.
+        if not ctx.authed():
+            raise ApiError(401, "Bad credentials")
+        return handle_graphql(ctx)
     if ctx.method in ("POST", "PUT", "PATCH", "DELETE"):
         ctx.load_body()
     if len(segments) >= 2 and segments[0] == "api" and segments[1] == "v3":
         if not ctx.authed():
             raise ApiError(401, "Bad credentials")
         return route_rest(ctx, segments[2:])
-    if segments == ["api", "graphql"] or segments == ["mcp"]:
-        if not ctx.authed():
-            raise ApiError(401, "Bad credentials")
-        raise not_found()   # stub: the GraphQL / MCP builders fill these in
     # /<owner>/<repo>.git/... git smart HTTP: the git builder fills this in.
     raise not_found()
 
