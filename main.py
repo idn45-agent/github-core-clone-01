@@ -408,13 +408,13 @@ class Ctx:
         self.method = handler.command
         self.body = None          # parsed JSON body (dict or None)
         self.raw_body = b""
+        self._raw_cache = None    # request body, read once (read_raw_body)
         host = handler.headers.get("Host") or "127.0.0.1"
         self.base_url = f"http://{host}"
 
     def load_body(self):
         """Read and JSON-parse the body; a malformed body is a 400."""
-        length = int(self.handler.headers.get("Content-Length") or 0)
-        self.raw_body = self.handler.rfile.read(length) if length > 0 else b""
+        self.raw_body = read_raw_body(self)
         if not self.raw_body:
             self.body = {}
             return
@@ -441,7 +441,7 @@ class Ctx:
                 handler.send_header(name, value)
         handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
-        if body:
+        if body and self.method != "HEAD":
             handler.wfile.write(body)
 
 
@@ -2522,6 +2522,14 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self):
         ctx = Ctx(self)
         try:
+            # Drain the body before anything can answer early: an
+            # error return (401, 404, ...) that leaves body bytes on
+            # a keep-alive connection corrupts the next request the
+            # client reuses that connection for — the leftover body
+            # parses as a request line and earns an HTML 400 from
+            # BaseHTTPRequestHandler (the graphql unknown-repository
+            # check caught exactly this).
+            read_raw_body(ctx)
             with STORE.lock:
                 dispatch(ctx)
         except ApiError as err:
@@ -3068,6 +3076,12 @@ RECEIVE_PACK_CAPS = (
 
 
 def read_raw_body(ctx: Ctx) -> bytes:
+    """The request body, read from the socket once and cached on the
+    ctx: the keep-alive drain in Handler._handle, load_body and the
+    git/MCP handlers all see the same bytes, and no path can leave
+    part of the body behind for the next request on the connection."""
+    if ctx._raw_cache is not None:
+        return ctx._raw_cache
     handler = ctx.handler
     if (handler.headers.get("Transfer-Encoding") or "").lower() == "chunked":
         chunks = []
@@ -3082,9 +3096,12 @@ def read_raw_body(ctx: Ctx) -> bytes:
                 break
             chunks.append(handler.rfile.read(size))
             handler.rfile.read(2)
-        return b"".join(chunks)
-    length = int(handler.headers.get("Content-Length") or 0)
-    return handler.rfile.read(length) if length > 0 else b""
+        data = b"".join(chunks)
+    else:
+        length = int(handler.headers.get("Content-Length") or 0)
+        data = handler.rfile.read(length) if length > 0 else b""
+    ctx._raw_cache = data
+    return data
 
 
 def send_raw(ctx: Ctx, status: int, body: bytes, content_type: str):
