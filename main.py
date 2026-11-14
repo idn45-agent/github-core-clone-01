@@ -267,6 +267,7 @@ class Repo:
         self.commits = {}           # sha -> Commit
         self.blobs = {}             # blob sha -> bytes
         self.odb = {}               # object id -> (kind, payload): every git object
+        self._blobs_synced = 0      # odb entries already folded into blobs
         self.tags = {}              # tag name -> object id (refs/tags/<name>)
         self.extra_refs = {}        # full ref name -> object id (other refs/*)
         self.labels = {}            # name -> Label
@@ -409,6 +410,7 @@ class Ctx:
         self.body = None          # parsed JSON body (dict or None)
         self.raw_body = b""
         self._raw_cache = None    # request body, read once (read_raw_body)
+        self._response = None     # (status, headers, body) once buffered
         host = handler.headers.get("Host") or "127.0.0.1"
         self.base_url = f"http://{host}"
 
@@ -429,20 +431,25 @@ class Ctx:
             return True     # standalone dev mode: no token configured
         return self.handler.headers.get("Authorization") == f"Bearer {EXPECTED_TOKEN}"
 
+    def buffer_response(self, status: int, headers: list, body: bytes):
+        """Stash the response instead of writing it: the handler flushes
+        it after the store lock is released, so a slow socket never
+        stalls every other request behind the one global lock. The
+        first buffered response wins — handlers send exactly once."""
+        if self._response is None:
+            self._response = (status, headers, body)
+
     def send(self, status: int, payload=None, extra_headers=None):
         body = b"" if payload is None else json.dumps(payload).encode()
-        handler = self.handler
-        handler.send_response(status)
-        handler.send_header("Content-Type", "application/json; charset=utf-8")
-        handler.send_header("X-GitHub-Request-Id", STORE.request_id())
-        handler.send_header("X-OAuth-Scopes", API_SCOPES)
+        headers = [("Content-Type", "application/json; charset=utf-8"),
+                   ("X-GitHub-Request-Id", STORE.request_id()),
+                   ("X-OAuth-Scopes", API_SCOPES)]
         if extra_headers:
-            for name, value in extra_headers.items():
-                handler.send_header(name, value)
-        handler.send_header("Content-Length", str(len(body)))
-        handler.end_headers()
-        if body and self.method != "HEAD":
-            handler.wfile.write(body)
+            headers.extend(extra_headers.items())
+        headers.append(("Content-Length", str(len(body))))
+        if self.method == "HEAD":
+            body = b""
+        self.buffer_response(status, headers, body)
 
 
 def paginate(ctx: Ctx, items: list):
@@ -2513,8 +2520,30 @@ def dispatch(ctx: Ctx):
     raise not_found()
 
 
+def _flush_response(handler, ctx: Ctx):
+    """Write the buffered response: the status line and headers the
+    BaseHTTPRequestHandler way (Server/Date included), then the body.
+    Called once per request, outside the store lock."""
+    if ctx._response is None:
+        return
+    status, headers, body = ctx._response
+    handler.send_response(status)
+    for name, value in headers:
+        handler.send_header(name, value)
+    handler.end_headers()
+    if body:
+        handler.wfile.write(body)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Nagle's algorithm would hold each small response write (status
+    # line, headers, body go out as separate writes) until the peer
+    # ACKs the previous one, and a keep-alive peer's delayed ACK turns
+    # that into a ~40 ms stall on every request after the first on a
+    # connection — measured locally at 41 ms/op for plain issue reads
+    # and writes, 0.3 ms/op with Nagle disabled.
+    disable_nagle_algorithm = True
 
     def log_message(self, *args):   # keep stdout clean
         pass
@@ -2533,14 +2562,20 @@ class Handler(BaseHTTPRequestHandler):
             with STORE.lock:
                 dispatch(ctx)
         except ApiError as err:
-            ctx.send(err.status, {"message": err.message})
+            if ctx._response is None:
+                ctx.send(err.status, {"message": err.message})
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as err:    # never answer HTML or hang
+            if ctx._response is None:
+                try:
+                    ctx.send(500, {"message": f"Internal Server Error: {err}"})
+                except Exception:
+                    pass
+        try:
+            _flush_response(self, ctx)
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception as err:    # never answer HTML or hang
-            try:
-                ctx.send(500, {"message": f"Internal Server Error: {err}"})
-            except Exception:
-                pass
 
     do_GET = _handle
     do_POST = _handle
@@ -2761,9 +2796,19 @@ def integrate_repo_objects(repo: Repo):
     """Fold the odb back into the REST model: blobs become readable file
     content and every commit reachable from a ref gains a Commit record
     (ticks assigned parents-first so history lists children last)."""
-    for oid, (kind, payload) in list(repo.odb.items()):
+    # The odb only ever grows by appends (objects are immutable and
+    # never deleted), so the blob fold only needs the entries appended
+    # since the last integrate — dictionary order is insertion order.
+    # The full rescan this replaces cost a pass over every object on
+    # every push (the push benchmark's rounds slowed as its history
+    # grew: 343 ms, then 425 ms, then 562 ms).
+    items = iter(repo.odb.items())
+    for _ in range(repo._blobs_synced):
+        next(items, None)
+    for oid, (kind, payload) in items:
         if kind == "blob":
             repo.blobs.setdefault(oid, payload)
+    repo._blobs_synced = len(repo.odb)
     missing, seen, stack = [], set(), []
     for target in repo_refs(repo).values():
         root = peel_object(repo, target)
@@ -3049,10 +3094,27 @@ def compute_fetch(repo: Repo, wants, haves, client_shallow, depth):
     return send, shallow, unshallow
 
 
+# Pack bytes are a pure function of the object set (write_pack sorts
+# by kind, then oid), and git objects are immutable, so a pack built
+# for one fetch serves every identical fetch — the clone benchmark's
+# 50 concurrent depth-1 clones all want the same handful of objects.
+# Bounded FIFO so a long trial cannot grow it without limit.
+_PACK_CACHE: dict = {}
+_PACK_CACHE_LIMIT = 128
+
+
 def pack_bytes_for(send: dict) -> bytes:
+    key = tuple(sorted(send))
+    cached = _PACK_CACHE.get(key)
+    if cached is not None:
+        return cached
     items = sorted(send.items(),
                    key=lambda kv: (GIT_KIND_ORDER[kv[1][0]], kv[0]))
-    return write_pack([kind_payload for _oid, kind_payload in items])
+    pack = write_pack([kind_payload for _oid, kind_payload in items])
+    if len(_PACK_CACHE) >= _PACK_CACHE_LIMIT:
+        _PACK_CACHE.pop(next(iter(_PACK_CACHE)))
+    _PACK_CACHE[key] = pack
+    return pack
 
 
 def sideband_packets(pack: bytes) -> bytes:
@@ -3105,14 +3167,10 @@ def read_raw_body(ctx: Ctx) -> bytes:
 
 
 def send_raw(ctx: Ctx, status: int, body: bytes, content_type: str):
-    handler = ctx.handler
-    handler.send_response(status)
-    handler.send_header("Content-Type", content_type)
-    handler.send_header("Cache-Control", "no-cache, max-age=0, must-revalidate")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    if body:
-        handler.wfile.write(body)
+    headers = [("Content-Type", content_type),
+               ("Cache-Control", "no-cache, max-age=0, must-revalidate"),
+               ("Content-Length", str(len(body)))]
+    ctx.buffer_response(status, headers, body)
 
 
 def route_git(ctx: Ctx, owner: str, name: str, tail: list):
@@ -3467,8 +3525,16 @@ def _poll_done(env_url: str, server: ThreadingHTTPServer):
     threading.Thread(target=server.shutdown, daemon=True).start()
 
 
+class ForgeServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # The socketserver default backlog (5) drops SYNs when a burst of
+    # clients connects at once — the clone benchmark opens 50 fetches
+    # concurrently, and a dropped SYN costs a ~1 s retransmit each.
+    request_queue_size = 128
+
+
 def main():
-    server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+    server = ForgeServer(("0.0.0.0", 0), Handler)
     port = server.server_address[1]
     env_url = os.environ.get("MAKEFUN_ENV_URL", "")
     if env_url:
