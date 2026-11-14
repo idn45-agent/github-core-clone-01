@@ -8,8 +8,9 @@ One file, Python 3.13 standard library only, no git binary. Sections:
   3. HTTP plumbing (auth, JSON bodies, pagination, protocol headers)
   4. REST v3: root/meta, repositories, git refs, branches, commits, contents
   5. REST v3: labels, issues, comments
-  6. Stubs for the later builders: pulls (in section 5's numbering space),
-     GraphQL v4 (/api/graphql), MCP (/mcp), git smart HTTP (/<o>/<r>.git/...)
+  5b. REST v3: pull requests (create/list/get/files/merge over the odb)
+  6. Stubs for the later builders: GraphQL v4 (/api/graphql), MCP (/mcp);
+     git smart HTTP (/<o>/<r>.git/...) lives in its own sections below
   7. The trial lifecycle (register, /done polling) and standalone mode
 
 Determinism: no wall clock and no randomness anywhere in a response. Times
@@ -19,6 +20,7 @@ byte-identical answers.
 """
 
 import base64
+import difflib
 import hashlib
 import json
 import os
@@ -197,6 +199,52 @@ class Comment:
             "node_id": f"IC_{self.id}",
             "body": self.body,
             "user": {"login": repo.owner_login, "id": 1, "type": "User"},
+            "created_at": iso_at(self.created_tick),
+            "updated_at": iso_at(self.updated_tick),
+        }
+
+
+class Pull:
+    """A pull request: head branch into base branch, sharing the repo's
+    issue/PR number counter. The head/base shas are the branch tips
+    resolved at creation; merging is computed from the live tips."""
+
+    def __init__(self, store, number, title, body, head_ref, head_sha,
+                 base_ref, base_sha):
+        self.id = store.next_id()
+        self.number = number
+        self.title = title
+        self.body = body
+        self.state = "open"
+        self.head_ref = head_ref
+        self.head_sha = head_sha
+        self.base_ref = base_ref
+        self.base_sha = base_sha
+        self.merged = False
+        self.merged_tick = None
+        self.merge_commit_sha = None
+        self.created_tick = store.tick()
+        self.updated_tick = self.created_tick
+        self.closed_tick = None
+
+    def view(self, repo) -> dict:
+        return {
+            "id": self.id,
+            "node_id": f"PR_{self.id}",
+            "number": self.number,
+            "state": self.state,
+            "title": self.title,
+            "body": self.body,
+            "user": {"login": repo.owner_login, "id": 1, "type": "User"},
+            "head": {"ref": self.head_ref, "sha": self.head_sha,
+                     "label": self.head_ref},
+            "base": {"ref": self.base_ref, "sha": self.base_sha,
+                     "label": self.base_ref},
+            "merged": self.merged,
+            "merged_at": iso_at(self.merged_tick) if self.merged_tick is not None else None,
+            "merge_commit_sha": self.merge_commit_sha,
+            "mergeable": pull_mergeable(repo, self),
+            "closed_at": iso_at(self.closed_tick) if self.closed_tick is not None else None,
             "created_at": iso_at(self.created_tick),
             "updated_at": iso_at(self.updated_tick),
         }
@@ -764,6 +812,244 @@ def list_comments(ctx: Ctx, owner: str, name: str, number: str):
 
 
 # ---------------------------------------------------------------------------
+# 5b. REST v3: pull requests
+# ---------------------------------------------------------------------------
+
+
+def _ancestor_distances(repo: Repo, tip: str) -> dict:
+    """sha -> shortest parent-walk distance from `tip` (inclusive)."""
+    dist = {tip: 0}
+    queue = [tip]
+    while queue:
+        sha = queue.pop(0)
+        commit = repo.commits.get(sha)
+        if commit is None:
+            continue
+        for parent in commit.parents:
+            if parent not in dist:
+                dist[parent] = dist[sha] + 1
+                queue.append(parent)
+    return dist
+
+
+def merge_base(repo: Repo, a: str, b: str):
+    """The best common ancestor of two commits, or None."""
+    if a not in repo.commits or b not in repo.commits:
+        return None
+    ancestors = _ancestor_distances(repo, a)
+    seen, queue, best = set(), [b], None
+    while queue:
+        sha = queue.pop(0)
+        if sha in seen:
+            continue
+        seen.add(sha)
+        if sha in ancestors:
+            if best is None or ancestors[sha] < ancestors[best]:
+                best = sha
+            continue
+        commit = repo.commits.get(sha)
+        if commit is not None:
+            queue.extend(commit.parents)
+    return best
+
+
+def three_way_merge(base: dict, ours: dict, theirs: dict):
+    """File-level three-way merge over {path: blob_sha} snapshots.
+
+    Returns the merged snapshot, or None when both sides changed the
+    same path to different blobs relative to the merge base."""
+    merged = {}
+    for path in set(base) | set(ours) | set(theirs):
+        b, o, t = base.get(path), ours.get(path), theirs.get(path)
+        if o == t:
+            winner = o
+        elif b == o:
+            winner = t
+        elif b == t:
+            winner = o
+        else:
+            return None
+        if winner is not None:
+            merged[path] = winner
+    return merged
+
+
+def _merge_plan(repo: Repo, base_tip: str, head_tip: str):
+    """(merge_base_sha, merged snapshot) for base<-head, or None on
+    conflict. A head already contained in the base merges trivially."""
+    base_sha = merge_base(repo, base_tip, head_tip)
+    if base_sha is None:
+        return None
+    base_files = repo.commits[base_sha].files
+    merged = three_way_merge(base_files, repo.commits[base_tip].files,
+                             repo.commits[head_tip].files)
+    if merged is None:
+        return None
+    return base_sha, merged
+
+
+def pull_mergeable(repo: Repo, pull: Pull):
+    """GitHub-style mergeable flag: True/False for open pulls whose two
+    tips are known, None once merged (or when it cannot be computed)."""
+    if pull.merged:
+        return None
+    base_tip = repo.branches.get(pull.base_ref, pull.base_sha)
+    head_tip = repo.branches.get(pull.head_ref, pull.head_sha)
+    if base_tip not in repo.commits or head_tip not in repo.commits:
+        return None
+    return _merge_plan(repo, base_tip, head_tip) is not None
+
+
+def _resolve_pull_ref(repo: Repo, value, field: str):
+    """Resolve a create-pull head/base: a branch name, an 'owner:branch'
+    label, or a bare commit sha. Returns (ref label, tip sha)."""
+    if not isinstance(value, str) or not value:
+        raise ApiError(422, f"Validation Failed: {field} is required")
+    ref = value.split(":", 1)[-1] if ":" in value else value
+    if ref in repo.branches:
+        return ref, repo.branches[ref]
+    if value in repo.commits:
+        return value, value
+    raise ApiError(422, f"Validation Failed: {field} '{value}' does not exist")
+
+
+def _pull(repo: Repo, number: str) -> Pull:
+    try:
+        pull = repo.pulls.get(int(number))
+    except (ValueError, TypeError):
+        pull = None
+    if pull is None:
+        raise not_found()
+    return pull
+
+
+def create_pull(ctx: Ctx, owner: str, name: str):
+    repo = resolve_repo(owner, name)
+    head_ref, head_sha = _resolve_pull_ref(repo, ctx.body.get("head"), "head")
+    base_ref, base_sha = _resolve_pull_ref(repo, ctx.body.get("base"), "base")
+    number = repo.next_number
+    repo.next_number += 1
+    title = ctx.body.get("title")
+    body = ctx.body.get("body")
+    pull = Pull(STORE, number,
+                title if isinstance(title, str) else "",
+                body if isinstance(body, str) else "",
+                head_ref, head_sha, base_ref, base_sha)
+    repo.pulls[number] = pull
+    ctx.send(201, pull.view(repo))
+
+
+def list_pulls(ctx: Ctx, owner: str, name: str):
+    repo = resolve_repo(owner, name)
+    state = ctx.query.get("state", "open")
+    items = [p for p in repo.pulls.values()
+             if state == "all" or p.state == state]
+    direction = ctx.query.get("direction", "desc")
+    items.sort(key=lambda p: p.created_tick, reverse=(direction != "asc"))
+    chunk, headers = paginate(ctx, items)
+    ctx.send(200, [pull.view(repo) for pull in chunk], headers)
+
+
+def get_pull(ctx: Ctx, owner: str, name: str, number: str):
+    repo = resolve_repo(owner, name)
+    ctx.send(200, _pull(repo, number).view(repo))
+
+
+def _blob_lines(repo: Repo, sha) -> list:
+    if sha is None:
+        return []
+    data = repo.blobs.get(sha, b"")
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def pull_files(repo: Repo, pull: Pull) -> list:
+    """The changed-path list: merge-base tree diffed against head tip."""
+    head_tip = repo.branches.get(pull.head_ref, pull.head_sha)
+    if head_tip not in repo.commits:
+        return []
+    base_sha = merge_base(repo, pull.base_sha, head_tip) or pull.base_sha
+    base_files = repo.commits[base_sha].files if base_sha in repo.commits else {}
+    head_files = repo.commits[head_tip].files
+    out = []
+    for path in sorted(set(base_files) | set(head_files)):
+        old, new = base_files.get(path), head_files.get(path)
+        if old == new:
+            continue
+        if old is None:
+            status = "added"
+        elif new is None:
+            status = "removed"
+        else:
+            status = "modified"
+        old_lines, new_lines = _blob_lines(repo, old), _blob_lines(repo, new)
+        additions = deletions = 0
+        matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines,
+                                          autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag in ("insert", "replace"):
+                additions += j2 - j1
+            if tag in ("delete", "replace"):
+                deletions += i2 - i1
+        patch_lines = [f"--- a/{path}", f"+++ b/{path}"]
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            patch_lines += [f"-{line}" for line in old_lines[i1:i2]]
+            patch_lines += [f"+{line}" for line in new_lines[j1:j2]]
+        entry = {
+            "sha": new if new is not None else old,
+            "filename": path,
+            "status": status,
+            "additions": additions,
+            "deletions": deletions,
+            "changes": additions + deletions,
+            "patch": "\n".join(patch_lines),
+        }
+        out.append(entry)
+    return out
+
+
+def list_pull_files(ctx: Ctx, owner: str, name: str, number: str):
+    repo = resolve_repo(owner, name)
+    pull = _pull(repo, number)
+    chunk, headers = paginate(ctx, pull_files(repo, pull))
+    ctx.send(200, chunk, headers)
+
+
+def merge_pull(ctx: Ctx, owner: str, name: str, number: str):
+    repo = resolve_repo(owner, name)
+    pull = _pull(repo, number)
+    if pull.merged or pull.state != "open":
+        raise ApiError(405, "Pull Request is not mergeable")
+    base_tip = repo.branches.get(pull.base_ref, pull.base_sha)
+    head_tip = repo.branches.get(pull.head_ref, pull.head_sha)
+    plan = None
+    if base_tip in repo.commits and head_tip in repo.commits:
+        plan = _merge_plan(repo, base_tip, head_tip)
+    if plan is None:
+        raise ApiError(405, "Pull Request is not mergeable")
+    _base_sha, merged_files = plan
+    message = (f"Merge pull request #{pull.number} from {pull.head_ref}"
+               f"\n\n{pull.title}")
+    tick = STORE.tick()
+    parents = [base_tip] if base_tip == head_tip else [base_tip, head_tip]
+    sha = commit_sha(tree_sha(merged_files), parents, message, tick)
+    commit = Commit(sha, dict(merged_files), parents, message, tick)
+    repo.commits[sha] = commit
+    materialize_rest_commit(repo, commit)
+    repo.branches[pull.base_ref] = sha
+    repo.updated_tick = tick
+    pull.merged = True
+    pull.merged_tick = tick
+    pull.merge_commit_sha = sha
+    pull.state = "closed"
+    pull.closed_tick = tick
+    pull.updated_tick = tick
+    ctx.send(200, {"sha": sha, "merged": True,
+                   "message": "Pull Request successfully merged"})
+
+
+# ---------------------------------------------------------------------------
 # 6. Router, stubs for the later builders, and the HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -835,7 +1121,24 @@ def route_rest(ctx: Ctx, rest: list):
             if method == "GET":
                 return list_comments(ctx, owner, name, tail[1])
             raise not_found()
-        # pulls and everything else: the pulls builder fills these in.
+        if tail == ["pulls"]:
+            if method == "POST":
+                return create_pull(ctx, owner, name)
+            if method == "GET":
+                return list_pulls(ctx, owner, name)
+            raise not_found()
+        if len(tail) == 2 and tail[0] == "pulls":
+            if method == "GET":
+                return get_pull(ctx, owner, name, tail[1])
+            raise not_found()
+        if len(tail) == 3 and tail[0] == "pulls" and tail[2] == "files":
+            if method == "GET":
+                return list_pull_files(ctx, owner, name, tail[1])
+            raise not_found()
+        if len(tail) == 3 and tail[0] == "pulls" and tail[2] == "merge":
+            if method == "PUT":
+                return merge_pull(ctx, owner, name, tail[1])
+            raise not_found()
         raise not_found()
     raise not_found()
 
