@@ -267,6 +267,7 @@ class Repo:
         self.commits = {}           # sha -> Commit
         self.blobs = {}             # blob sha -> bytes
         self.odb = {}               # object id -> (kind, payload): every git object
+        self._blobs_synced = 0      # odb entries already folded into blobs
         self.tags = {}              # tag name -> object id (refs/tags/<name>)
         self.extra_refs = {}        # full ref name -> object id (other refs/*)
         self.labels = {}            # name -> Label
@@ -2795,9 +2796,19 @@ def integrate_repo_objects(repo: Repo):
     """Fold the odb back into the REST model: blobs become readable file
     content and every commit reachable from a ref gains a Commit record
     (ticks assigned parents-first so history lists children last)."""
-    for oid, (kind, payload) in list(repo.odb.items()):
+    # The odb only ever grows by appends (objects are immutable and
+    # never deleted), so the blob fold only needs the entries appended
+    # since the last integrate — dictionary order is insertion order.
+    # The full rescan this replaces cost a pass over every object on
+    # every push (the push benchmark's rounds slowed as its history
+    # grew: 343 ms, then 425 ms, then 562 ms).
+    items = iter(repo.odb.items())
+    for _ in range(repo._blobs_synced):
+        next(items, None)
+    for oid, (kind, payload) in items:
         if kind == "blob":
             repo.blobs.setdefault(oid, payload)
+    repo._blobs_synced = len(repo.odb)
     missing, seen, stack = [], set(), []
     for target in repo_refs(repo).values():
         root = peel_object(repo, target)
