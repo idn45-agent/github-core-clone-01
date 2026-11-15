@@ -4,23 +4,28 @@
 One file, Python 3.13 standard library only, no git binary. Sections:
 
   1. Logical clock + git object hashing (real git blob/tree/commit shas)
-  2. The in-memory store (users, repos, branches, commits, issues, labels)
-  3. HTTP plumbing (auth, JSON bodies, pagination, protocol headers)
-  4. REST v3: root/meta, repositories, git refs, branches, commits, contents
-  5. REST v3: labels, issues, comments
-  5b. REST v3: pull requests (create/list/get/files/merge over the odb)
-  5c. Relay global ids, shared by every surface (the pull merge core
-     itself stays with the pulls section, 5b)
-  5d. GraphQL v4 (/api/graphql): a small executor over the same store
-  5e. MCP (/mcp): JSON-RPC tools over the same store
-  6. Router and the HTTP handler; git smart HTTP (/<o>/<r>.git/...)
-     lives in its own sections below
-  7. The trial lifecycle (register, /done polling) and standalone mode
+  2. Git object payload codecs, memoised by object id
+  3. The in-memory store (users, repos, branches, commits, issues, labels)
+  4. HTTP plumbing (auth, JSON bodies, pagination, protocol headers)
+  5. REST v3: root/meta, repositories, git refs, branches, commits,
+     contents, labels, issues, comments, pull requests
+  6. GraphQL v4 (/api/graphql) and MCP (/mcp) over the same store
+  7. Git smart HTTP: pkt-lines, packfiles, upload-pack, receive-pack
+  8. A lean threaded HTTP/1.1 transport (one send per response, minimal
+     header parsing) and the trial lifecycle (register, /done polling)
 
-Determinism: no wall clock and no randomness anywhere in a response. Times
-come from a logical clock (a fixed base instant plus a per-store tick) and
-every id is a sequential counter, so a replayed request sequence produces
-byte-identical answers.
+Performance shape: the timed workloads are thousands of small requests,
+so the hot path is built to spend as little as possible per request —
+responses are assembled as one bytes object and written with a single
+send, repeated issue reads serve memoised JSON bytes, git object
+parsing is memoised by object id, and read-only git fetches plan their
+packs from a ref snapshot without queueing behind the store lock that
+serialises every mutation.
+
+Determinism: no wall clock and no randomness anywhere in a response.
+Times come from a logical clock (a fixed base instant plus a per-store
+tick) and every id is a sequential counter, so a replayed request
+sequence produces byte-identical answers.
 """
 
 import base64
@@ -28,6 +33,8 @@ import difflib
 import hashlib
 import json
 import os
+import platform
+import socket
 import struct
 import threading
 import time
@@ -35,7 +42,8 @@ import urllib.error
 import urllib.request
 import zlib
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from functools import lru_cache
+from http.client import responses as STATUS_REASONS
 from urllib.parse import parse_qs, unquote, urlsplit
 
 # ---------------------------------------------------------------------------
@@ -50,8 +58,12 @@ INSTALLED_VERSION = "3.10.0"
 API_SCOPES = "repo, read:org"
 
 
+@lru_cache(maxsize=16384)
 def iso_at(tick: int) -> str:
-    """The ISO-8601 instant `tick` seconds after the base instant."""
+    """The ISO-8601 instant `tick` seconds after the base instant.
+
+    Views ask for the same few ticks over and over (every issue read
+    formats its creation tick), so the strftime result is memoised."""
     return (BASE_INSTANT + timedelta(seconds=tick)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -109,7 +121,99 @@ def commit_sha(tree: str, parents: list, message: str, tick: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 2. The in-memory store
+# 2. Git object payload codecs, memoised by object id
+#
+# Git objects are immutable and their ids are content hashes, so a parse
+# of one payload is valid forever and for every repository. The fetch
+# planner, the ancestry walks and the post-push integration all re-read
+# the same commits and trees; memoising their parses by object id turns
+# those repeated walks into dict lookups.
+# ---------------------------------------------------------------------------
+
+
+def parse_tree_payload(payload: bytes):
+    """[(mode, name, oid)] for a raw tree object."""
+    entries = []
+    pos = 0
+    while pos < len(payload):
+        space = payload.index(b" ", pos)
+        mode = payload[pos:space].decode()
+        nul = payload.index(b"\x00", space)
+        name = payload[space + 1:nul].decode("utf-8", "replace")
+        oid = payload[nul + 1:nul + 21].hex()
+        entries.append((mode, name, oid))
+        pos = nul + 21
+    return entries
+
+
+def parse_commit_payload(payload: bytes):
+    head, _, message = payload.partition(b"\n\n")
+    tree, parents = None, []
+    for line in head.split(b"\n"):
+        if line.startswith(b"tree "):
+            tree = line[5:].decode()
+        elif line.startswith(b"parent "):
+            parents.append(line[7:].decode())
+    return {"tree": tree, "parents": parents, "message": message}
+
+
+def parse_tag_payload(payload: bytes):
+    head = payload.split(b"\n\n", 1)[0]
+    target, kind = None, None
+    for line in head.split(b"\n"):
+        if line.startswith(b"object "):
+            target = line[7:].decode()
+        elif line.startswith(b"type "):
+            kind = line[5:].decode()
+    return {"object": target, "type": kind}
+
+
+_COMMIT_INFO: dict = {}
+_TREE_INFO: dict = {}
+_TAG_INFO: dict = {}
+
+
+def commit_info_of(repo, oid: str):
+    """parse_commit_payload of the commit `oid` in `repo`'s odb,
+    memoised; None when the object is absent or not a commit."""
+    info = _COMMIT_INFO.get(oid)
+    if info is None:
+        obj = repo.odb.get(oid)
+        if obj is None or obj[0] != "commit":
+            return None
+        info = parse_commit_payload(obj[1])
+        _COMMIT_INFO[oid] = info
+    return info
+
+
+def tree_entries_of(repo, oid: str):
+    """parse_tree_payload of the tree `oid`, memoised; None when the
+    object is absent or not a tree."""
+    entries = _TREE_INFO.get(oid)
+    if entries is None:
+        obj = repo.odb.get(oid)
+        if obj is None or obj[0] != "tree":
+            return None
+        entries = parse_tree_payload(obj[1])
+        _TREE_INFO[oid] = entries
+    return entries
+
+
+def tag_info_of(repo, oid: str):
+    """parse_tag_payload of the tag `oid`, memoised; None when the
+    object is absent or not a tag."""
+    info = _TAG_INFO.get(oid)
+    if info is None:
+        obj = repo.odb.get(oid)
+        if obj is None or obj[0] != "tag":
+            return None
+        info = parse_tag_payload(obj[1])
+        _TAG_INFO[oid] = info
+    return info
+
+
+# ---------------------------------------------------------------------------
+# 3. The in-memory store
 # ---------------------------------------------------------------------------
 
 
@@ -171,6 +275,8 @@ class Issue:
         self.created_tick = store.tick()
         self.updated_tick = self.created_tick
         self.closed_tick = None
+        self._view_json = None      # memoised view bytes + their login
+        self._view_login = None
 
     def view(self, repo) -> dict:
         out = {
@@ -188,6 +294,26 @@ class Issue:
             "closed_at": iso_at(self.closed_tick) if self.closed_tick is not None else None,
         }
         return out
+
+    def view_json(self, repo) -> bytes:
+        """The issue view as response bytes, memoised.
+
+        A single-issue read is the read workload's whole operation —
+        thousands of identical GETs of one issue — so the serialised
+        bytes are built once and served until something the view shows
+        changes: a field patch (touch()) or a new comment (touch()).
+        The login baked into the view is part of the memo key: the
+        viewer's login is learned once, early, but a memo built before
+        that would carry the placeholder."""
+        login = repo.owner_login
+        if self._view_json is None or self._view_login != login:
+            self._view_json = json.dumps(self.view(repo)).encode()
+            self._view_login = login
+        return self._view_json
+
+    def touch(self):
+        """Forget the memoised view: the issue changed."""
+        self._view_json = None
 
 
 class Comment:
@@ -266,18 +392,29 @@ class Repo:
         self.branches = {}          # branch name -> tip commit sha
         self.commits = {}           # sha -> Commit
         self.blobs = {}             # blob sha -> bytes
-        self.odb = {}               # object id -> (kind, payload): every git object
-        self._blobs_synced = 0      # odb entries already folded into blobs
+        self.odb = {}               # object id -> (kind, payload)
+        self._pending_blobs = []    # blobs appended since the last fold
         self.tags = {}              # tag name -> object id (refs/tags/<name>)
         self.extra_refs = {}        # full ref name -> object id (other refs/*)
         self.labels = {}            # name -> Label
         self.issues = {}            # number -> Issue
-        self.pulls = {}             # number -> Pull (later builder)
+        self.pulls = {}             # number -> Pull
         self.next_number = 1        # shared by issues and pulls, as on GitHub
 
     @property
     def owner_login(self) -> str:
         return STORE.viewer_login or "user"
+
+    def odb_add(self, oid: str, entry):
+        """Append one object to the odb, logging new blobs for the
+        REST fold (integrate_repo_objects) so it stays O(new)."""
+        if oid not in self.odb and entry[0] == "blob":
+            self._pending_blobs.append((oid, entry[1]))
+        self.odb[oid] = entry
+
+    def odb_add_many(self, objects: dict):
+        for oid, entry in objects.items():
+            self.odb_add(oid, entry)
 
     def tip(self, branch: str):
         return self.branches.get(branch)
@@ -379,8 +516,9 @@ class Store:
 
 STORE = Store()
 
+
 # ---------------------------------------------------------------------------
-# 3. HTTP plumbing
+# 4. HTTP plumbing
 # ---------------------------------------------------------------------------
 
 EXPECTED_TOKEN = os.environ.get("MAKEFUN_SHOP_TOKEN", "")
@@ -398,14 +536,24 @@ def not_found() -> ApiError:
 
 
 class Ctx:
-    """One request: parsed path/query/body plus response helpers."""
+    """One request: parsed path/query/body plus response helpers.
+
+    `handler` is the transport's request shim: .command, .path,
+    .headers (with a case-insensitive .get) and .rfile (the buffered
+    connection reader the body is drained from)."""
 
     def __init__(self, handler):
         self.handler = handler
         split = urlsplit(handler.path)
         self.raw_path = split.path
-        self.segments = [unquote(s) for s in split.path.split("/") if s != ""]
-        self.query = {k: v[0] for k, v in parse_qs(split.query).items()}
+        # unquote is comparatively dear and most segments carry no
+        # escape at all; only pay for it where a '%' actually appears.
+        self.segments = [s if "%" not in s else unquote(s)
+                         for s in split.path.split("/") if s != ""]
+        # Most timed requests carry no query string; parse_qs on an
+        # empty one is pure overhead, so skip it then.
+        self.query = ({k: v[0] for k, v in parse_qs(split.query).items()}
+                      if split.query else {})
         self.method = handler.command
         self.body = None          # parsed JSON body (dict or None)
         self.raw_body = b""
@@ -432,21 +580,33 @@ class Ctx:
         return self.handler.headers.get("Authorization") == f"Bearer {EXPECTED_TOKEN}"
 
     def buffer_response(self, status: int, headers: list, body: bytes):
-        """Stash the response instead of writing it: the handler flushes
-        it after the store lock is released, so a slow socket never
-        stalls every other request behind the one global lock. The
-        first buffered response wins — handlers send exactly once."""
+        """Stash the response instead of writing it: the transport
+        flushes it after the store lock is released, so a slow socket
+        never stalls every other request behind the one global lock.
+        The first buffered response wins — handlers send exactly once."""
         if self._response is None:
             self._response = (status, headers, body)
 
-    def send(self, status: int, payload=None, extra_headers=None):
-        body = b"" if payload is None else json.dumps(payload).encode()
+    def _headers(self, body_len: int, extra_headers) -> list:
         headers = [("Content-Type", "application/json; charset=utf-8"),
                    ("X-GitHub-Request-Id", STORE.request_id()),
                    ("X-OAuth-Scopes", API_SCOPES)]
         if extra_headers:
             headers.extend(extra_headers.items())
-        headers.append(("Content-Length", str(len(body))))
+        headers.append(("Content-Length", str(body_len)))
+        return headers
+
+    def send(self, status: int, payload=None, extra_headers=None):
+        body = b"" if payload is None else json.dumps(payload).encode()
+        headers = self._headers(len(body), extra_headers)
+        if self.method == "HEAD":
+            body = b""
+        self.buffer_response(status, headers, body)
+
+    def send_body(self, status: int, body: bytes, extra_headers=None):
+        """send() for a handler that already holds the exact response
+        bytes (a memoised view): identical headers, no re-serialise."""
+        headers = self._headers(len(body), extra_headers)
         if self.method == "HEAD":
             body = b""
         self.buffer_response(status, headers, body)
@@ -506,7 +666,7 @@ def resolve_repo(owner: str, name: str) -> Repo:
 
 
 # ---------------------------------------------------------------------------
-# 4. REST v3: root, meta, repositories, refs, branches, commits, contents
+# 5. REST v3: root, meta, repositories, refs, branches, commits, contents
 # ---------------------------------------------------------------------------
 
 
@@ -722,7 +882,7 @@ def delete_contents(ctx: Ctx, owner: str, name: str, path: str):
                                                "tree": {"sha": tree_sha(files)}}})
 
 # ---------------------------------------------------------------------------
-# 5. REST v3: labels, issues, comments
+# 5 (continued). REST v3: labels, issues, comments
 # ---------------------------------------------------------------------------
 
 
@@ -763,7 +923,7 @@ def create_issue(ctx: Ctx, owner: str, name: str):
     repo.next_number += 1
     issue = Issue(STORE, number, ctx.body.get("title"), ctx.body.get("body"), labels)
     repo.issues[number] = issue
-    ctx.send(201, issue.view(repo))
+    ctx.send_body(201, issue.view_json(repo))
 
 
 def list_issues(ctx: Ctx, owner: str, name: str):
@@ -788,7 +948,7 @@ def _issue(repo: Repo, number: str) -> Issue:
 
 def get_issue(ctx: Ctx, owner: str, name: str, number: str):
     repo = resolve_repo(owner, name)
-    ctx.send(200, _issue(repo, number).view(repo))
+    ctx.send_body(200, _issue(repo, number).view_json(repo))
 
 
 def patch_issue(ctx: Ctx, owner: str, name: str, number: str):
@@ -804,7 +964,8 @@ def patch_issue(ctx: Ctx, owner: str, name: str, number: str):
         issue.state = ctx.body["state"]
         issue.closed_tick = STORE.tick() if issue.state == "closed" else None
     issue.updated_tick = STORE.tick()
-    ctx.send(200, issue.view(repo))
+    issue.touch()
+    ctx.send_body(200, issue.view_json(repo))
 
 
 def create_comment(ctx: Ctx, owner: str, name: str, number: str):
@@ -812,6 +973,7 @@ def create_comment(ctx: Ctx, owner: str, name: str, number: str):
     issue = _issue(repo, number)
     comment = Comment(STORE, ctx.body.get("body"))
     issue.comments.append(comment)
+    issue.touch()               # the view's comment count just changed
     ctx.send(201, comment.view(repo))
 
 
@@ -823,7 +985,7 @@ def list_comments(ctx: Ctx, owner: str, name: str, number: str):
 
 
 # ---------------------------------------------------------------------------
-# 5b. REST v3: pull requests
+# 5 (continued). REST v3: pull requests
 # ---------------------------------------------------------------------------
 
 
@@ -1079,7 +1241,7 @@ def merge_pull(ctx: Ctx, owner: str, name: str, number: str):
 
 
 # ---------------------------------------------------------------------------
-# 5c. Shared surface operations: Relay global ids
+# 5 (continued). Shared surface operations: Relay global ids
 # ---------------------------------------------------------------------------
 
 
@@ -1135,7 +1297,7 @@ def find_by_global_id(text):
 
 
 # ---------------------------------------------------------------------------
-# 5d. GraphQL v4: lexer, parser and value resolution
+# 6. GraphQL v4: lexer, parser and value resolution
 # ---------------------------------------------------------------------------
 
 
@@ -1417,7 +1579,7 @@ def _gql_value(value, variables):
 
 
 # ---------------------------------------------------------------------------
-# 5d (continued). GraphQL schema surface, executor and handler
+# 6 (continued). GraphQL schema surface, executor and handler
 # ---------------------------------------------------------------------------
 
 # The field list of every object type the executor serves. It drives
@@ -1740,6 +1902,7 @@ def _resolve_mutation(ctx, name, args, env):
             issue.state = "closed"
             issue.closed_tick = STORE.tick()
         issue.updated_tick = STORE.tick()
+        issue.touch()
         return {"__type": "CloseIssuePayload",
                 "clientMutationId": data.get("clientMutationId"),
                 "issue": _issue_ctx(repo, issue)}
@@ -1789,6 +1952,7 @@ def _resolve_mutation(ctx, name, args, env):
         repo, issue = found[1], found[2]
         comment = Comment(STORE, data.get("body"))
         issue.comments.append(comment)
+        issue.touch()           # the REST view's comment count changed
         return {"__type": "AddCommentPayload",
                 "clientMutationId": data.get("clientMutationId"),
                 "subject": _issue_ctx(repo, issue),
@@ -2163,7 +2327,7 @@ def handle_graphql(ctx: Ctx):
 
 
 # ---------------------------------------------------------------------------
-# 5e. MCP: JSON-RPC tools over the same store
+# 6 (continued). MCP: JSON-RPC tools over the same store
 # ---------------------------------------------------------------------------
 
 # The legacy handshake era: the client probes server/discover first,
@@ -2237,6 +2401,13 @@ def _mcp_tools() -> list:
     ]
 
 
+# tools/list is asked for repeatedly and must answer byte-identically;
+# serialise the catalogue once instead of rebuilding + re-dumping it
+# for every call.
+_MCP_TOOLS_RESULT = {"tools": _mcp_tools()}
+_MCP_TOOLS_BY_NAME = {tool["name"]: tool for tool in _MCP_TOOLS_RESULT["tools"]}
+
+
 def _mcp_tool_result(payload, is_error: bool = False) -> dict:
     """One tools/call result: the object as a JSON text block and as
     structured content, so a client may read either."""
@@ -2248,8 +2419,7 @@ def _mcp_tool_result(payload, is_error: bool = False) -> dict:
 
 
 def _mcp_call_tool(name, args, base_url: str) -> dict:
-    tools = {tool["name"]: tool for tool in _mcp_tools()}
-    tool = tools.get(name)
+    tool = _MCP_TOOLS_BY_NAME.get(name)
     if tool is None:
         raise McpError(-32602, f"Unknown tool: {name}")
     if not isinstance(args, dict):
@@ -2344,7 +2514,7 @@ def _mcp_dispatch(request, base_url: str):
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": _mcp_tools()}
+            result = _MCP_TOOLS_RESULT
         elif method == "tools/call":
             result = _mcp_call_tool(params.get("name"),
                                     params.get("arguments"), base_url)
@@ -2398,7 +2568,7 @@ def handle_mcp(ctx: Ctx):
 
 
 # ---------------------------------------------------------------------------
-# 6. Router and the HTTP handler
+# 6 (continued). Router
 # ---------------------------------------------------------------------------
 
 
@@ -2516,77 +2686,11 @@ def dispatch(ctx: Ctx):
         if not ctx.authed():
             raise ApiError(401, "Bad credentials")
         return route_rest(ctx, segments[2:])
-    # /<owner>/<repo>.git/... git smart HTTP: the git builder fills this in.
     raise not_found()
 
 
-def _flush_response(handler, ctx: Ctx):
-    """Write the buffered response: the status line and headers the
-    BaseHTTPRequestHandler way (Server/Date included), then the body.
-    Called once per request, outside the store lock."""
-    if ctx._response is None:
-        return
-    status, headers, body = ctx._response
-    handler.send_response(status)
-    for name, value in headers:
-        handler.send_header(name, value)
-    handler.end_headers()
-    if body:
-        handler.wfile.write(body)
-
-
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    # Nagle's algorithm would hold each small response write (status
-    # line, headers, body go out as separate writes) until the peer
-    # ACKs the previous one, and a keep-alive peer's delayed ACK turns
-    # that into a ~40 ms stall on every request after the first on a
-    # connection — measured locally at 41 ms/op for plain issue reads
-    # and writes, 0.3 ms/op with Nagle disabled.
-    disable_nagle_algorithm = True
-
-    def log_message(self, *args):   # keep stdout clean
-        pass
-
-    def _handle(self):
-        ctx = Ctx(self)
-        try:
-            # Drain the body before anything can answer early: an
-            # error return (401, 404, ...) that leaves body bytes on
-            # a keep-alive connection corrupts the next request the
-            # client reuses that connection for — the leftover body
-            # parses as a request line and earns an HTML 400 from
-            # BaseHTTPRequestHandler (the graphql unknown-repository
-            # check caught exactly this).
-            read_raw_body(ctx)
-            with STORE.lock:
-                dispatch(ctx)
-        except ApiError as err:
-            if ctx._response is None:
-                ctx.send(err.status, {"message": err.message})
-        except (BrokenPipeError, ConnectionResetError):
-            return
-        except Exception as err:    # never answer HTML or hang
-            if ctx._response is None:
-                try:
-                    ctx.send(500, {"message": f"Internal Server Error: {err}"})
-                except Exception:
-                    pass
-        try:
-            _flush_response(self, ctx)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    do_GET = _handle
-    do_POST = _handle
-    do_PUT = _handle
-    do_PATCH = _handle
-    do_DELETE = _handle
-    do_HEAD = _handle
-
-
 # ---------------------------------------------------------------------------
-# 6b. Git smart HTTP: pkt-lines, packfiles, upload-pack and receive-pack
+# 7. Git smart HTTP: pkt-lines, packfiles, upload-pack and receive-pack
 # ---------------------------------------------------------------------------
 
 ZERO_OID = "0" * 40
@@ -2643,52 +2747,16 @@ class PktReader:
         return self.data[self.pos:]
 
 
-# --- object payloads -------------------------------------------------------
+# --- object materialisation -------------------------------------------------
 
 
-def parse_tree_payload(payload: bytes):
-    """[(mode, name, oid)] for a raw tree object."""
-    entries = []
-    pos = 0
-    while pos < len(payload):
-        space = payload.index(b" ", pos)
-        mode = payload[pos:space].decode()
-        nul = payload.index(b"\x00", space)
-        name = payload[space + 1:nul].decode("utf-8", "replace")
-        oid = payload[nul + 1:nul + 21].hex()
-        entries.append((mode, name, oid))
-        pos = nul + 21
-    return entries
-
-
-def parse_commit_payload(payload: bytes):
-    head, _, message = payload.partition(b"\n\n")
-    tree, parents = None, []
-    for line in head.split(b"\n"):
-        if line.startswith(b"tree "):
-            tree = line[5:].decode()
-        elif line.startswith(b"parent "):
-            parents.append(line[7:].decode())
-    return {"tree": tree, "parents": parents, "message": message}
-
-
-def parse_tag_payload(payload: bytes):
-    head = payload.split(b"\n\n", 1)[0]
-    target, kind = None, None
-    for line in head.split(b"\n"):
-        if line.startswith(b"object "):
-            target = line[7:].decode()
-        elif line.startswith(b"type "):
-            kind = line[5:].decode()
-    return {"object": target, "type": kind}
-
-
-def peel_object(repo: Repo, oid: str) -> str:
+def peel_object(repo, oid: str) -> str:
     """Follow tag objects to the first non-tag object."""
     seen = set()
     while oid in repo.odb and repo.odb[oid][0] == "tag" and oid not in seen:
         seen.add(oid)
-        target = parse_tag_payload(repo.odb[oid][1])["object"]
+        info = tag_info_of(repo, oid)
+        target = info["object"] if info else None
         if target is None:
             break
         oid = target
@@ -2719,7 +2787,7 @@ def build_tree_objects(repo: Repo, files: dict) -> str:
             for name, mode, sha in entries
         )
         sha = git_hash("tree", payload)
-        repo.odb[sha] = ("tree", payload)
+        repo.odb_add(sha, ("tree", payload))
         return sha
 
     return build(nested)
@@ -2730,7 +2798,7 @@ def materialize_rest_commit(repo: Repo, commit: Commit):
     so the git layer can advertise and ship it."""
     for sha in commit.files.values():
         if sha not in repo.odb and sha in repo.blobs:
-            repo.odb[sha] = ("blob", repo.blobs[sha])
+            repo.odb_add(sha, ("blob", repo.blobs[sha]))
     root = build_tree_objects(repo, commit.files)
     stamp = BASE_UNIX + commit.tick
     lines = [f"tree {root}"]
@@ -2738,16 +2806,16 @@ def materialize_rest_commit(repo: Repo, commit: Commit):
     lines.append(f"author {AUTHOR_NAME} <{AUTHOR_EMAIL}> {stamp} +0000")
     lines.append(f"committer {AUTHOR_NAME} <{AUTHOR_EMAIL}> {stamp} +0000")
     payload = ("\n".join(lines) + "\n\n" + commit.message).encode()
-    repo.odb[commit.sha] = ("commit", payload)
+    repo.odb_add(commit.sha, ("commit", payload))
 
 
-def tree_snapshot(repo: Repo, tree_oid: str, prefix: str = "") -> dict:
+def tree_snapshot(repo, tree_oid: str, prefix: str = "") -> dict:
     """The {path: blob_sha} snapshot a tree object describes."""
     out: dict = {}
-    obj = repo.odb.get(tree_oid)
-    if obj is None or obj[0] != "tree":
+    entries = tree_entries_of(repo, tree_oid)
+    if entries is None:
         return out
-    for mode, name, oid in parse_tree_payload(obj[1]):
+    for mode, name, oid in entries:
         if mode == "40000":
             out.update(tree_snapshot(repo, oid, prefix + name + "/"))
         elif mode != "160000":      # gitlinks have no blob to snapshot
@@ -2758,7 +2826,7 @@ def tree_snapshot(repo: Repo, tree_oid: str, prefix: str = "") -> dict:
 # --- refs ------------------------------------------------------------------
 
 
-def repo_refs(repo: Repo) -> dict:
+def repo_refs(repo) -> dict:
     refs = {f"refs/heads/{name}": oid for name, oid in repo.branches.items()}
     refs.update({f"refs/tags/{name}": oid for name, oid in repo.tags.items()})
     refs.update(repo.extra_refs)
@@ -2779,16 +2847,19 @@ def set_ref(repo: Repo, ref: str, oid):
         table[key] = oid
 
 
-def is_ancestor(repo: Repo, ancestor: str, descendant: str) -> bool:
+def is_ancestor(repo, ancestor: str, descendant: str) -> bool:
     stack, seen = [descendant], set()
     while stack:
         oid = stack.pop()
         if oid == ancestor:
             return True
-        if oid in seen or oid not in repo.odb or repo.odb[oid][0] != "commit":
+        if oid in seen:
+            continue
+        info = commit_info_of(repo, oid)
+        if info is None:
             continue
         seen.add(oid)
-        stack.extend(parse_commit_payload(repo.odb[oid][1])["parents"])
+        stack.extend(info["parents"])
     return False
 
 
@@ -2796,19 +2867,14 @@ def integrate_repo_objects(repo: Repo):
     """Fold the odb back into the REST model: blobs become readable file
     content and every commit reachable from a ref gains a Commit record
     (ticks assigned parents-first so history lists children last)."""
-    # The odb only ever grows by appends (objects are immutable and
-    # never deleted), so the blob fold only needs the entries appended
-    # since the last integrate — dictionary order is insertion order.
-    # The full rescan this replaces cost a pass over every object on
-    # every push (the push benchmark's rounds slowed as its history
-    # grew: 343 ms, then 425 ms, then 562 ms).
-    items = iter(repo.odb.items())
-    for _ in range(repo._blobs_synced):
-        next(items, None)
-    for oid, (kind, payload) in items:
-        if kind == "blob":
+    # The blob fold drains the append log odb_add maintains: objects
+    # are immutable and only ever appended, so the fold is O(new)
+    # instead of a pass over every object on every push (a full rescan
+    # made the push benchmark's rounds slow as its history grew).
+    if repo._pending_blobs:
+        for oid, payload in repo._pending_blobs:
             repo.blobs.setdefault(oid, payload)
-    repo._blobs_synced = len(repo.odb)
+        repo._pending_blobs.clear()
     missing, seen, stack = [], set(), []
     for target in repo_refs(repo).values():
         root = peel_object(repo, target)
@@ -2820,14 +2886,21 @@ def integrate_repo_objects(repo: Repo):
             continue
         seen.add(oid)
         missing.append(oid)
-        stack.extend(parse_commit_payload(repo.odb[oid][1])["parents"])
+        info = commit_info_of(repo, oid)
+        if info is not None:
+            stack.extend(info["parents"])
     missing_set = set(missing)
     done: set = set()
     remaining = list(missing)
     while remaining:
         progressed = False
         for oid in list(remaining):
-            info = parse_commit_payload(repo.odb[oid][1])
+            info = commit_info_of(repo, oid)
+            if info is None:
+                remaining.remove(oid)
+                done.add(oid)
+                progressed = True
+                continue
             if any(p in missing_set and p not in done for p in info["parents"]):
                 continue
             files = tree_snapshot(repo, info["tree"]) if info["tree"] else {}
@@ -2860,11 +2933,12 @@ def pack_object_header(kind: str, size: int) -> bytes:
 def write_pack(objects) -> bytes:
     """A version-2 packfile of undeltified objects + its SHA-1 trailer."""
     objects = list(objects)
-    body = bytearray(b"PACK" + struct.pack(">II", 2, len(objects)))
+    parts = [b"PACK" + struct.pack(">II", 2, len(objects))]
     for kind, payload in objects:
-        body += pack_object_header(kind, len(payload))
-        body += zlib.compress(payload)
-    return bytes(body) + hashlib.sha1(bytes(body)).digest()
+        parts.append(pack_object_header(kind, len(payload)))
+        parts.append(zlib.compress(payload))
+    body = b"".join(parts)
+    return body + hashlib.sha1(body).digest()
 
 
 def _inflate_at(data: bytes, pos: int):
@@ -2963,26 +3037,33 @@ def read_pack(data: bytes, external) -> dict:
             entries.append((start, GIT_CODE_KINDS[code], None, raw))
         else:
             raise ValueError(f"pack object type {code}")
+    # Whole objects resolve in one pass (the common case: the packs the
+    # suite sends are undeltified); only true deltas join the fixpoint
+    # loop below, each against bases resolved before it.
     resolved: dict = {}
     by_offset: dict = {}
-    pending = list(entries)
+    pending = []
+    for start, kind, base, raw in entries:
+        if kind is not None:
+            oid = git_hash(kind, raw)
+            resolved[oid] = (kind, raw)
+            by_offset[start] = oid
+        else:
+            pending.append((start, base, raw))
     while pending:
         progressed, remaining = False, []
-        for start, kind, base, raw in pending:
-            if kind is not None:
-                base_kind, payload = kind, raw
-            else:
-                found = None
-                if base[0] == "ofs" and base[1] in by_offset:
-                    found = resolved[by_offset[base[1]]]
-                elif base[0] == "ref":
-                    found = resolved.get(base[1]) or external(base[1])
-                if found is None:
-                    remaining.append((start, kind, base, raw))
-                    continue
-                base_kind, payload = found[0], apply_delta(found[1], raw)
-            oid = git_hash(base_kind, payload)
-            resolved[oid] = (base_kind, payload)
+        for start, base, raw in pending:
+            found = None
+            if base[0] == "ofs" and base[1] in by_offset:
+                found = resolved[by_offset[base[1]]]
+            elif base[0] == "ref":
+                found = resolved.get(base[1]) or external(base[1])
+            if found is None:
+                remaining.append((start, base, raw))
+                continue
+            payload = apply_delta(found[1], raw)
+            oid = git_hash(found[0], payload)
+            resolved[oid] = (found[0], payload)
             by_offset[start] = oid
             progressed = True
         if not progressed:
@@ -2994,24 +3075,24 @@ def read_pack(data: bytes, external) -> dict:
 # --- fetch planning --------------------------------------------------------
 
 
-def _tree_closure(repo: Repo, tree_oid: str, out: set):
+def _tree_closure(repo, tree_oid: str, out: set):
     stack = [tree_oid]
     while stack:
         oid = stack.pop()
         if oid in out:
             continue
-        obj = repo.odb.get(oid)
-        if obj is None or obj[0] != "tree":
+        entries = tree_entries_of(repo, oid)
+        if entries is None:
             continue
         out.add(oid)
-        for mode, _name, child in parse_tree_payload(obj[1]):
+        for mode, _name, child in entries:
             if mode == "40000":
                 stack.append(child)
             elif mode != "160000":
                 out.add(child)
 
 
-def compute_fetch(repo: Repo, wants, haves, client_shallow, depth):
+def compute_fetch(repo, wants, haves, client_shallow, depth):
     """Plan a fetch: ({oid: (kind, payload)} to send, shallow, unshallow).
 
     Commit generations are counted from the wants (the tip is generation
@@ -3034,7 +3115,10 @@ def compute_fetch(repo: Repo, wants, haves, client_shallow, depth):
         gen = gens[commit]
         if depth is not None and gen >= depth:
             continue
-        for parent in parse_commit_payload(repo.odb[commit][1])["parents"]:
+        info = commit_info_of(repo, commit)
+        if info is None:
+            continue
+        for parent in info["parents"]:
             if parent not in repo.odb:
                 continue
             if parent not in gens or gens[parent] > gen + 1:
@@ -3046,14 +3130,16 @@ def compute_fetch(repo: Repo, wants, haves, client_shallow, depth):
         oid = want
         while oid in repo.odb and repo.odb[oid][0] == "tag":
             want_objects.add(oid)
-            oid = parse_tag_payload(repo.odb[oid][1])["object"]
+            info = tag_info_of(repo, oid)
+            oid = info["object"] if info else None
             if oid is None:
                 break
         if oid in repo.odb and repo.odb[oid][0] != "commit":
             want_objects.add(oid)           # a directly wanted tree/blob
     for commit in gens:
         want_objects.add(commit)
-        tree = parse_commit_payload(repo.odb[commit][1])["tree"]
+        info = commit_info_of(repo, commit)
+        tree = info["tree"] if info else None
         if tree:
             _tree_closure(repo, tree, want_objects)
 
@@ -3064,15 +3150,18 @@ def compute_fetch(repo: Repo, wants, haves, client_shallow, depth):
         if oid in have_objects or oid not in repo.odb:
             continue
         have_objects.add(oid)
-        kind, payload = repo.odb[oid]
+        kind = repo.odb[oid][0]
         if kind == "commit":
-            info = parse_commit_payload(payload)
+            info = commit_info_of(repo, oid)
+            if info is None:
+                continue
             if info["tree"]:
                 _tree_closure(repo, info["tree"], have_objects)
             if oid not in client_shallow:
                 stack.extend(info["parents"])
         elif kind == "tag":
-            target = parse_tag_payload(payload)["object"]
+            info = tag_info_of(repo, oid)
+            target = info["object"] if info else None
             if target:
                 stack.append(target)
 
@@ -3084,7 +3173,8 @@ def compute_fetch(repo: Repo, wants, haves, client_shallow, depth):
         for commit, gen in gens.items():
             if gen != depth:
                 continue
-            parents = parse_commit_payload(repo.odb[commit][1])["parents"]
+            info = commit_info_of(repo, commit)
+            parents = info["parents"] if info else []
             if any(p in repo.odb and p not in gens for p in parents):
                 boundary.add(commit)
                 shallow.append(commit)
@@ -3124,6 +3214,25 @@ def sideband_packets(pack: bytes) -> bytes:
     return bytes(out)
 
 
+# The sideband framing of a pack is as pure a function of the object
+# set as the pack itself, and re-framing copies every pack byte per
+# fetch — the clone benchmark's 50 fetches of one pack would each pay
+# it. Cache the framed bytes beside the pack, under the same key.
+_SIDEBAND_CACHE: dict = {}
+
+
+def sideband_bytes_for(send: dict) -> bytes:
+    key = tuple(sorted(send))
+    cached = _SIDEBAND_CACHE.get(key)
+    if cached is not None:
+        return cached
+    framed = sideband_packets(pack_bytes_for(send))
+    if len(_SIDEBAND_CACHE) >= _PACK_CACHE_LIMIT:
+        _SIDEBAND_CACHE.pop(next(iter(_SIDEBAND_CACHE)))
+    _SIDEBAND_CACHE[key] = framed
+    return framed
+
+
 # --- smart HTTP handlers ---------------------------------------------------
 
 UPLOAD_PACK_CAPS = (
@@ -3139,7 +3248,7 @@ RECEIVE_PACK_CAPS = (
 
 def read_raw_body(ctx: Ctx) -> bytes:
     """The request body, read from the socket once and cached on the
-    ctx: the keep-alive drain in Handler._handle, load_body and the
+    ctx: the keep-alive drain in the transport, load_body and the
     git/MCP handlers all see the same bytes, and no path can leave
     part of the body behind for the next request on the connection."""
     if ctx._raw_cache is not None:
@@ -3173,10 +3282,43 @@ def send_raw(ctx: Ctx, status: int, body: bytes, content_type: str):
     ctx.buffer_response(status, headers, body)
 
 
+class _RepoSnapshot:
+    """A read-only facade over one repository for the lockless git
+    read path: the odb is shared live (objects are immutable and only
+    ever appended, so lock-free reads stay consistent), while the ref
+    tables and the default branch are point-in-time copies taken under
+    the store lock."""
+
+    __slots__ = ("odb", "branches", "tags", "extra_refs", "default_branch")
+
+    def __init__(self, repo: Repo):
+        self.odb = repo.odb
+        self.branches = dict(repo.branches)
+        self.tags = dict(repo.tags)
+        self.extra_refs = dict(repo.extra_refs)
+        self.default_branch = repo.default_branch
+
+
 def route_git(ctx: Ctx, owner: str, name: str, tail: list):
     if not ctx.authed():
         raise ApiError(401, "Bad credentials")
     repo = resolve_repo(owner, name)
+    return _route_git_with(ctx, repo, tail)
+
+
+def route_git_read(ctx: Ctx, owner: str, name: str, tail: list):
+    """info/refs and upload-pack without the store lock: resolve the
+    repository and snapshot its refs under a brief lock, then plan the
+    answer against the immutable odb in the open. Fifty concurrent
+    clones no longer queue behind every mutation in the process."""
+    if not ctx.authed():
+        raise ApiError(401, "Bad credentials")
+    with STORE.lock:
+        repo = _RepoSnapshot(resolve_repo(owner, name))
+    return _route_git_with(ctx, repo, tail)
+
+
+def _route_git_with(ctx: Ctx, repo, tail: list):
     try:
         if tail == ["info", "refs"] and ctx.method == "GET":
             return git_info_refs(ctx, repo)
@@ -3189,7 +3331,18 @@ def route_git(ctx: Ctx, owner: str, name: str, tail: list):
     raise not_found()
 
 
-def git_info_refs(ctx: Ctx, repo: Repo):
+def is_git_read(ctx: Ctx) -> bool:
+    """True for the two read-only git endpoints the transport may run
+    outside the store lock (advertisement reads and fetches)."""
+    segments = ctx.segments
+    if len(segments) < 3 or not segments[1].endswith(".git"):
+        return False
+    tail = segments[2:]
+    return (tail == ["info", "refs"] and ctx.method == "GET") \
+        or (tail == ["git-upload-pack"] and ctx.method == "POST")
+
+
+def git_info_refs(ctx: Ctx, repo):
     service = ctx.query.get("service", "")
     if service not in ("git-upload-pack", "git-receive-pack"):
         raise ApiError(400, "unknown service")
@@ -3205,7 +3358,7 @@ def git_info_refs(ctx: Ctx, repo: Repo):
     send_raw(ctx, 200, body, f"application/x-{service}-advertisement")
 
 
-def v0_advertisement(repo: Repo, service: str) -> bytes:
+def v0_advertisement(repo, service: str) -> bytes:
     caps = UPLOAD_PACK_CAPS if service == "git-upload-pack" else RECEIVE_PACK_CAPS
     if service == "git-upload-pack":
         caps += f" symref=HEAD:refs/heads/{repo.default_branch}"
@@ -3243,7 +3396,7 @@ def _v2_sections(body: bytes):
     return caps, args
 
 
-def git_upload_pack(ctx: Ctx, repo: Repo):
+def git_upload_pack(ctx: Ctx, repo):
     body = read_raw_body(ctx)
     proto = ctx.handler.headers.get("Git-Protocol") or ""
     if "version=2" in proto or body[4:].startswith(b"command="):
@@ -3260,7 +3413,7 @@ def git_upload_pack(ctx: Ctx, repo: Repo):
     send_raw(ctx, 200, payload, "application/x-git-upload-pack-result")
 
 
-def ls_refs_response(repo: Repo, args) -> bytes:
+def ls_refs_response(repo, args) -> bytes:
     peel = "peel" in args
     symrefs = "symrefs" in args
     unborn = "unborn" in args
@@ -3315,7 +3468,7 @@ def _fetch_args(args):
     return wants, haves, client_shallow, depth
 
 
-def fetch_response_v2(repo: Repo, args) -> bytes:
+def fetch_response_v2(repo, args) -> bytes:
     wants, haves, client_shallow, depth = _fetch_args(args)
     for want in wants:
         if want not in repo.odb:
@@ -3344,11 +3497,11 @@ def fetch_response_v2(repo: Repo, args) -> bytes:
         sections.append(bytes(section))
     if send:
         sections.append(pkt_line("packfile\n")
-                        + sideband_packets(pack_bytes_for(send)))
+                        + sideband_bytes_for(send))
     return PKT_DELIM.join(sections) + PKT_FLUSH if sections else PKT_FLUSH
 
 
-def fetch_response_v0(repo: Repo, body: bytes) -> bytes:
+def fetch_response_v0(repo, body: bytes) -> bytes:
     reader = PktReader(body)
     wants, haves, client_shallow, depth = [], [], set(), None
     caps: list = []
@@ -3397,7 +3550,7 @@ def fetch_response_v0(repo: Repo, body: bytes) -> bytes:
     else:
         out += pkt_line("NAK\n")
     if send:
-        out += sideband_packets(pack_bytes_for(send))
+        out += sideband_bytes_for(send)
     out += PKT_FLUSH
     return bytes(out)
 
@@ -3425,7 +3578,7 @@ def git_receive_pack(ctx: Ctx, repo: Repo):
     unpack_error = None
     if pack_bytes:
         try:
-            repo.odb.update(read_pack(pack_bytes, repo.odb.get))
+            repo.odb_add_many(read_pack(pack_bytes, repo.odb.get))
         except Exception as err:            # a bad pack refuses every ref
             unpack_error = str(err).replace("\n", " ")
 
@@ -3484,8 +3637,212 @@ def _apply_ref_update(repo: Repo, refs_now: dict, old: str, new: str, ref: str):
 
 
 # ---------------------------------------------------------------------------
-# 7. The trial lifecycle
+# 8. The HTTP transport and the trial lifecycle
+#
+# The timed workloads are thousands of small requests, many of them on
+# one keep-alive connection, so the transport is hand-rolled to spend
+# as little as possible per request: the request head is parsed with a
+# few byte splits (no email-parser header machinery), the body is read
+# through one buffered reader per connection, and each response —
+# status line, Server/Date, headers, body — is assembled as a single
+# bytes object and written with one sendall. Nagle is disabled per
+# connection: a keep-alive peer's delayed ACK would otherwise hold
+# every small response for ~40 ms.
 # ---------------------------------------------------------------------------
+
+SERVER_VERSION = f"BaseHTTP/0.6 Python/{platform.python_version()}"
+
+
+class _Headers:
+    """The few headers the forge reads, case-insensitively: the first
+    occurrence of a name wins, as with the stdlib header parser."""
+
+    __slots__ = ("_map",)
+
+    def __init__(self, pairs):
+        self._map = {}
+        for name, value in pairs:
+            self._map.setdefault(name, value)
+
+    def get(self, name, default=None):
+        return self._map.get(name.lower(), default)
+
+
+class _Request:
+    """The transport's request shim: exactly the attributes Ctx and
+    read_raw_body read off the stdlib handler (.command, .path,
+    .headers, .rfile), plus the keep-alive verdict for the loop."""
+
+    __slots__ = ("command", "path", "headers", "rfile", "keep_alive")
+
+    def __init__(self, command, path, headers, keep_alive):
+        self.command = command
+        self.path = path
+        self.headers = headers
+        self.rfile = None
+        self.keep_alive = keep_alive
+
+
+def _read_request_head(reader):
+    """Parse one request head off the connection's buffered reader.
+
+    Returns a _Request, or None when the connection is done (EOF, or a
+    request line too malformed to answer — the stdlib handler answered
+    those with an HTML error page; no client of this forge sends one,
+    and the forge never answers HTML, so the connection just closes).
+    """
+    line = reader.readline(65537)
+    if not line:
+        return None
+    if line in (b"\r\n", b"\n"):
+        # One leading empty line is tolerated, as the stdlib does.
+        line = reader.readline(65537)
+        if not line:
+            return None
+    parts = line.split()
+    if len(parts) < 2:
+        return None
+    command = parts[0].decode("latin-1")
+    path = parts[1].decode("latin-1")
+    version = parts[2].decode("latin-1") if len(parts) > 2 else "HTTP/1.0"
+    pairs = []
+    while True:
+        hline = reader.readline(65537)
+        if hline in (b"\r\n", b"\n", b""):
+            break
+        name, sep, value = hline.partition(b":")
+        if not sep:
+            continue
+        pairs.append((name.strip().lower().decode("latin-1"),
+                      value.strip().decode("latin-1")))
+    headers = _Headers(pairs)
+    connection = (headers.get("Connection") or "").lower()
+    if version == "HTTP/1.0":
+        keep_alive = connection == "keep-alive"
+    else:
+        keep_alive = connection != "close"
+    return _Request(command, path, headers, keep_alive)
+
+
+_DATE_CACHE = (0, "")
+
+
+def _date_header() -> str:
+    """The Date header value, formatted at most once a second: the
+    header's own resolution is one second, and strftime+gmtime per
+    request is measurable across thousands of requests."""
+    global _DATE_CACHE
+    now = int(time.time())
+    if _DATE_CACHE[0] != now:
+        _DATE_CACHE = (now, time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                                          time.gmtime(now)))
+    return _DATE_CACHE[1]
+
+
+def _response_bytes(ctx: Ctx):
+    """The buffered response as one wire bytes object: status line,
+    Server and Date (the stdlib handler's pair), the handler's own
+    headers, blank line, body."""
+    if ctx._response is None:
+        return None
+    status, headers, body = ctx._response
+    reason = STATUS_REASONS.get(status, "???")
+    date = _date_header()
+    parts = [f"HTTP/1.1 {status} {reason}\r\n"
+             f"Server: {SERVER_VERSION}\r\n"
+             f"Date: {date}\r\n"]
+    for name, value in headers:
+        parts.append(f"{name}: {value}\r\n")
+    parts.append("\r\n")
+    return "".join(parts).encode("latin-1") + body
+
+
+def _serve_request(req: _Request):
+    """Run one request end to end and return its wire bytes (None when
+    the connection broke mid-request). Mirrors the old stdlib handler's
+    contract: the body is drained before anything can answer early (an
+    error return that leaves body bytes on a keep-alive connection
+    corrupts the next request on it), dispatch runs under the store
+    lock, and the response is flushed only after the lock is released —
+    except the read-only git endpoints, which plan from a ref snapshot
+    and the immutable odb without taking the lock at all."""
+    ctx = Ctx(req)
+    try:
+        read_raw_body(ctx)
+        if is_git_read(ctx):
+            route_git_read(ctx, ctx.segments[0], ctx.segments[1][:-4],
+                           ctx.segments[2:])
+        else:
+            with STORE.lock:
+                dispatch(ctx)
+    except ApiError as err:
+        if ctx._response is None:
+            ctx.send(err.status, {"message": err.message})
+    except (BrokenPipeError, ConnectionResetError):
+        return None
+    except Exception as err:    # never answer HTML or hang
+        if ctx._response is None:
+            try:
+                ctx.send(500, {"message": f"Internal Server Error: {err}"})
+            except Exception:
+                pass
+    return _response_bytes(ctx)
+
+
+def _connection_loop(conn: socket.socket):
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        reader = conn.makefile("rb", buffering=65536)
+        while True:
+            req = _read_request_head(reader)
+            if req is None:
+                break
+            req.rfile = reader
+            if (req.headers.get("Expect") or "").lower() == "100-continue":
+                conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+            payload = _serve_request(req)
+            if payload is None:
+                break
+            conn.sendall(payload)
+            if not req.keep_alive:
+                break
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+class ForgeServer:
+    """Listen socket + one daemon thread per connection. The listen
+    backlog is deep: the clone benchmark opens 50 fetches at once, and
+    a dropped SYN costs a ~1 s retransmit each."""
+
+    def __init__(self, address):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(address)
+        self.sock.listen(128)
+        self.port = self.sock.getsockname()[1]
+        self._shutdown = False
+
+    def serve_forever(self):
+        while not self._shutdown:
+            try:
+                conn, _addr = self.sock.accept()
+            except OSError:
+                break
+            threading.Thread(target=_connection_loop, args=(conn,),
+                             daemon=True).start()
+
+    def shutdown(self):
+        self._shutdown = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 def _env_json(method: str, url: str, payload=None):
@@ -3512,7 +3869,7 @@ def _register(env_url: str, port: int):
         delay = min(delay * 2, 2.0)
 
 
-def _poll_done(env_url: str, server: ThreadingHTTPServer):
+def _poll_done(env_url: str, server: ForgeServer):
     delay = 0.25
     while True:
         try:
@@ -3522,35 +3879,22 @@ def _poll_done(env_url: str, server: ThreadingHTTPServer):
             pass
         time.sleep(delay)
         delay = min(delay * 1.5, 1.0)
-    threading.Thread(target=server.shutdown, daemon=True).start()
-
-
-class ForgeServer(ThreadingHTTPServer):
-    daemon_threads = True
-    # The socketserver default backlog (5) drops SYNs when a burst of
-    # clients connects at once — the clone benchmark opens 50 fetches
-    # concurrently, and a dropped SYN costs a ~1 s retransmit each.
-    request_queue_size = 128
+    server.shutdown()
 
 
 def main():
-    server = ForgeServer(("0.0.0.0", 0), Handler)
-    port = server.server_address[1]
+    server = ForgeServer(("0.0.0.0", 0))
     env_url = os.environ.get("MAKEFUN_ENV_URL", "")
     if env_url:
-        _register(env_url, port)
-        threading.Thread(target=_poll_done, args=(env_url, server), daemon=True).start()
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        server.server_close()
-    else:
-        # Standalone: serve forever (local development and smoke tests).
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
+        _register(env_url, server.port)
+        threading.Thread(target=_poll_done, args=(env_url, server),
+                         daemon=True).start()
+    # With no env URL this is standalone mode: serve forever (local
+    # development and smoke tests). With one, serve until /done.
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
