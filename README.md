@@ -1,24 +1,44 @@
-# github-core-clone-01
+# github-core-clone-01 — Forge
 
-A standalone GitHub-compatible git forge in one Python file (`main.py`,
-Python 3.13, standard library only — no git binary, no external packages).
+A standalone GitHub-compatible forge in a single Python 3.13 file
+(`main.py`), standard library only, no UI, no git binary.
 
-It serves, from one process:
+## What it serves
 
-- GitHub REST v3 under `/api/v3` (repositories, branches, commits, contents,
-  issues, comments, labels; pull requests land in the same file),
-- GraphQL v4 at `/api/graphql` and MCP at `/mcp` (sections in `main.py`),
-- git smart HTTP at `/<owner>/<repo>.git/...` (pure-Python protocol),
-- the make.fun trial lifecycle: bind an ephemeral port, register it with
-  `$MAKEFUN_ENV_URL/register`, poll `$MAKEFUN_ENV_URL/done`, exit 0.
+- **Git smart HTTP**, protocol v0 and v2: `info/refs`, `ls-refs`,
+  `fetch` (with shallow/deepen semantics and sideband pack streaming)
+  and `receive-pack` (report-status, fast-forward enforcement), backed
+  by an append-only in-memory object store.
+- **REST v3**: repositories, branches, git refs, commits, contents,
+  labels, issues, comments, pull requests (files diff, squash/merge).
+- **GraphQL v4**: queries, mutations, cursor connections,
+  introspection, operation batching.
+- **MCP** over Streamable HTTP (revision 2026-07-28):
+  `server/discover`, `tools/list`, `tools/call` with eight tools that
+  act on the same store as REST.
 
-## Run it
+## Running
+
+The program binds an ephemeral port, registers it with
+`$MAKEFUN_ENV_URL/register`, and exits with status 0 when
+`$MAKEFUN_ENV_URL/done` reports the trial is over. `$MAKEFUN_SHOP_TOKEN`
+is the bearer token every surface authenticates against. For local
+testing, `FORGE_PORT` pins the listen port.
 
 ```sh
-python3 main.py            # trial mode when MAKEFUN_ENV_URL is set
-python3 main.py            # standalone (serve forever) when it is not
+MAKEFUN_SHOP_TOKEN=dev FORGE_PORT=8080 python3 main.py
 ```
 
-State is in memory and fully deterministic: timestamps come from a logical
-clock and every id is sequential, so two runs of the same request sequence
-produce byte-identical answers.
+## Design notes
+
+- Hand-rolled HTTP/1.1 transport: one buffered reader per connection,
+  responses assembled as a single `bytes` and sent with one `sendall`,
+  `TCP_NODELAY`, correct keep-alive with request bodies always drained.
+- Git reads are planned from a snapshot of the refs over the immutable
+  object store — no global lock; only mutations serialize.
+- Memoization where it pays: issue JSON views cached as bytes (invalidated
+  on mutation), the MCP tool catalog serialized once, git object parses
+  cached by oid, packfiles and their sideband framing cached by object
+  set, the `Date` header cached per second.
+- Deterministic: a logical clock drives every timestamp and id, so a
+  replayed request sequence produces byte-identical state.
