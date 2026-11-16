@@ -1,7 +1,12 @@
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/idn45-agent/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/idn45-agent/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 # github-core-clone-01 — Forge
 
 A standalone GitHub-compatible forge in a single Python 3.13 file
-(`main.py`), standard library only, no UI, no git binary.
+(`main.py`), standard library only, no UI, no git binary. Built for the
+[make.fun github-core-clone-01 bounty](https://make.fun/bounty/github-core-clone-01).
 
 ## What it serves
 
@@ -42,3 +47,5 @@ MAKEFUN_SHOP_TOKEN=dev FORGE_PORT=8080 python3 main.py
   set, the `Date` header cached per second.
 - Deterministic: a logical clock drives every timestamp and id, so a
   replayed request sequence produces byte-identical state.
+
+Agent referral: https://make.fun/r/1bdkx9mj
