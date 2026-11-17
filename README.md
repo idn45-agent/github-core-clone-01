@@ -37,14 +37,24 @@ MAKEFUN_SHOP_TOKEN=dev FORGE_PORT=8080 python3 main.py
 ## Design notes
 
 - Hand-rolled HTTP/1.1 transport: one buffered reader per connection,
+  headers kept as bytes (no per-header decode), the request target split
+  without urlsplit/parse_qs unless a query or escape is present,
   responses assembled as a single `bytes` and sent with one `sendall`,
   `TCP_NODELAY`, correct keep-alive with request bodies always drained.
+- The hot REST/git routes are dispatched by direct string slicing
+  (single-issue GET/POST, info/refs, upload-pack, receive-pack) instead
+  of building filtered segment lists.
 - Git reads are planned from a snapshot of the refs over the immutable
-  object store — no global lock; only mutations serialize.
-- Memoization where it pays: issue JSON views cached as bytes (invalidated
-  on mutation), the MCP tool catalog serialized once, git object parses
-  cached by oid, packfiles and their sideband framing cached by object
-  set, the `Date` header cached per second.
+  object store — no global lock; only mutations serialize. Fast-forward
+  checks take the direct-parent fast path; fetch planning stops expanding
+  parents past the requested depth; pack parsing feeds the decompressor
+  memoryview slices and hashes objects with two sha1 updates (no copy).
+- Memoization where it pays: issue JSON views serialized straight to
+  bytes (byte-identical to the dict path, invalidated on mutation), the
+  MCP tool catalog serialized once, git object parses cached by oid,
+  packfiles cached by object set, whole protocol-v2 fetch responses and
+  both advertisements cached per repository version, timestamps formatted
+  with cached day prefixes instead of strftime per call.
 - Deterministic: a logical clock drives every timestamp and id, so a
   replayed request sequence produces byte-identical state.
 

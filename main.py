@@ -33,12 +33,13 @@ import time
 import urllib.request
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote
 
 # --------------------------------------------------------------------------
 # configuration
 
 TOKEN = os.environ.get("MAKEFUN_SHOP_TOKEN", "")
+_AUTH_HEADER = ("Bearer " + TOKEN).encode("ascii") if TOKEN else None
 ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
 VERSION = "1.0.0"
 ZERO_OID = b"\x00" * 20
@@ -164,8 +165,24 @@ class LogicalClock:
 CLOCK = LogicalClock()
 
 
+_ISO_DAY_CACHE = {}
+
+
 def iso_of(seconds):
-    return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """RFC 3339 UTC timestamp. The day prefix is cached and the clock part
+    is integer arithmetic: strftime per call was a measurable cost on the
+    issue/commit serialization paths."""
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    prefix = _ISO_DAY_CACHE.get(days)
+    if prefix is None:
+        prefix = datetime.fromtimestamp(days * 86400, timezone.utc).strftime("%Y-%m-%dT")
+        if len(_ISO_DAY_CACHE) > 128:
+            _ISO_DAY_CACHE.clear()
+        _ISO_DAY_CACHE[days] = prefix
+    hh, rem = divmod(rem, 3600)
+    mm, ss = divmod(rem, 60)
+    return "%s%02d:%02d:%02dZ" % (prefix, hh, mm, ss)
 
 
 # --------------------------------------------------------------------------
@@ -173,6 +190,11 @@ def iso_of(seconds):
 
 def json_bytes(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+# The viewer login as a JSON string literal, reused by issue_json_bytes:
+# logins here are [a-z0-9-] by construction, so the quoted form is constant.
+_VIEWER_LOGIN_JSON = json_bytes(VIEWER_LOGIN)
 
 
 def parse_json_body(body):
@@ -195,7 +217,12 @@ NAME_TYPES = {name: code for code, name in TYPE_NAMES.items()}
 
 def object_id(type_code, data):
     header = TYPE_NAMES[type_code].encode("ascii") + b" " + str(len(data)).encode("ascii") + b"\x00"
-    return hashlib.sha1(header + data).digest()
+    # Feed the hash in two updates: header + data used to copy the whole
+    # object into one temporary bytes.
+    digest = hashlib.sha1()
+    digest.update(header)
+    digest.update(data)
+    return digest.digest()
 
 
 def hex_of(oid):
@@ -218,7 +245,8 @@ class Repo:
         "created_ts", "objects", "refs", "commit_info", "tree_info",
         "tree_closure_cache", "flat_cache", "issues", "pulls", "labels",
         "comments", "next_number", "next_comment_id", "version",
-        "pack_cache", "pack_lock", "issue_get_cache",
+        "pack_cache", "pack_lock", "issue_get_cache", "ad_cache",
+        "fetch_resp_cache",
     )
 
     def __init__(self, repo_id, owner, name, description, private, created_ts):
@@ -245,6 +273,8 @@ class Repo:
         self.pack_cache = {}
         self.pack_lock = threading.Lock()
         self.issue_get_cache = {}    # number -> response body bytes
+        self.ad_cache = {}           # (service, version, default_branch) -> ad bytes
+        self.fetch_resp_cache = {}   # fetch key -> full v2 response bytes
 
     @property
     def full_name(self):
@@ -256,6 +286,8 @@ class Repo:
     def bump(self):
         self.version += 1
         self.pack_cache.clear()
+        self.ad_cache.clear()
+        self.fetch_resp_cache.clear()
 
     # -- objects -----------------------------------------------------------
 
@@ -451,6 +483,11 @@ class Repo:
             seen.add(current)
             info = self.commit(current)
             if info is not None:
+                # Fast path: a push's old tip is almost always the new
+                # commit's direct parent; that settles fast-forward in O(1)
+                # instead of walking the whole history.
+                if ancestor in info[1]:
+                    return True
                 stack.extend(info[1])
         return False
 
@@ -567,6 +604,9 @@ def parse_pack(repo, data):
     limit = len(data) - 20
     local = {}  # pack offset -> oid, for ofs-delta bases
     stored = 0
+    # A memoryview slice costs no copy; data[pos:] used to copy the whole
+    # remaining pack for every object (quadratic on a 600-object push).
+    view = memoryview(data)
     for _ in range(count):
         start = pos
         byte = data[pos]
@@ -594,7 +634,9 @@ def parse_pack(repo, data):
             base_oid = data[pos:pos + 20]
             pos += 20
         decomp = zlib.decompressobj()
-        raw = decomp.decompress(data[pos:]) + decomp.flush()
+        raw = decomp.decompress(view[pos:])
+        if not decomp.eof:
+            raw += decomp.flush()
         pos = len(data) - len(decomp.unused_data)
         if len(raw) != size:
             raise ValueError("pack object size mismatch")
@@ -643,6 +685,11 @@ def compute_fetch(repo, wants, haves, depth, shallow):
     while head < len(queue):
         current = queue[head]
         head += 1
+        # With a depth bound, parents past depth - 1 can never enter the
+        # included set, so do not walk them (a depth-1 fetch of a 200-commit
+        # history visits one commit instead of all 200).
+        if depth is not None and dist[current] >= depth - 1:
+            continue
         info = repo.commit(current)
         if info is None:
             continue
@@ -849,7 +896,7 @@ class Forge:
 
     def next_request_id(self):
         self.request_counter += 1
-        return "%012x" % self.request_counter
+        return b"%012x" % self.request_counter
 
 
 FORGE = Forge()
@@ -934,6 +981,44 @@ def issue_json(repo, issue, origin=""):
         "html_url": "%s/%s/issues/%d" % (origin, repo.full_name, issue.number),
         "repository_url": "%s/api/v3/repos/%s" % (origin, repo.full_name),
     }
+
+
+def issue_json_bytes(repo, issue, origin=""):
+    """The GET/POST issue response body as bytes, assembled directly
+    instead of dict -> json.dumps. Byte-identical to
+    json_bytes(issue_json(repo, issue, origin)) for issues without labels;
+    labelled issues fall back to the dict path."""
+    if issue.labels:
+        return json_bytes(issue_json(repo, issue, origin))
+    base = "%s/api/v3/repos/%s/issues/%d" % (origin, repo.full_name, issue.number)
+    # One %-format over a bytes template: the dict path paid a json.dumps
+    # call per string field (eight of them) plus a dict build. Fields whose
+    # values can never need JSON escaping (base64 node ids, open/closed,
+    # the viewer login, fixed-format timestamps) are quoted literally;
+    # title, body and the URLs still go through json.dumps.
+    return (
+        b'{"id":%d,"node_id":"%s","number":%d,"title":%s,"body":%s,'
+        b'"state":"%s","labels":[],"user":{"login":%s,"id":%d,"type":"User"},'
+        b'"comments":%d,"created_at":"%s","updated_at":"%s","closed_at":%s,'
+        b'"url":%s,"html_url":%s,"repository_url":%s}'
+        % (
+            issue.id,
+            global_id("issue", repo.id, issue.number).encode("ascii"),
+            issue.number,
+            json_bytes(issue.title),
+            json_bytes(issue.body),
+            issue.state.encode("ascii"),
+            _VIEWER_LOGIN_JSON if repo.owner == VIEWER_LOGIN else json_bytes(repo.owner),
+            VIEWER_ID,
+            len(issue.comments),
+            iso_of(issue.created_ts).encode("ascii"),
+            iso_of(issue.updated_ts).encode("ascii"),
+            b'"' + iso_of(issue.closed_ts).encode("ascii") + b'"' if issue.closed_ts else b"null",
+            json_bytes(base),
+            json_bytes("%s/%s/issues/%d" % (origin, repo.full_name, issue.number)),
+            json_bytes("%s/api/v3/repos/%s" % (origin, repo.full_name)),
+        )
+    )
 
 
 def comment_json(repo, comment, origin=""):
@@ -1074,8 +1159,14 @@ STATUS_TEXT = {
     405: "Method Not Allowed", 409: "Conflict", 422: "Unprocessable Entity",
     500: "Internal Server Error",
 }
+_STATUS_TEXT_B = {code: text.encode("ascii") for code, text in STATUS_TEXT.items()}
 
 JSON_TYPE = "application/json; charset=utf-8"
+JSON_TYPE_B = JSON_TYPE.encode("latin-1")
+_CT_UPLOAD_AD = b"application/x-git-upload-pack-advertisement"
+_CT_UPLOAD_RESULT = b"application/x-git-upload-pack-result"
+_CT_RECEIVE_AD = b"application/x-git-receive-pack-advertisement"
+_CT_RECEIVE_RESULT = b"application/x-git-receive-pack-result"
 
 
 class Request:
@@ -1095,7 +1186,7 @@ class Request:
     def authorized(self):
         if not TOKEN:
             return True
-        return self.headers.get("authorization") == "Bearer " + TOKEN
+        return self.headers.get(b"authorization") == _AUTH_HEADER
 
 
 class Response:
@@ -1104,12 +1195,17 @@ class Response:
     def __init__(self, status, body=b"", content_type=None, extra=None):
         self.status = status
         self.body = body
-        self.content_type = content_type
+        # content_type is stored as bytes: _send writes it without encoding.
+        self.content_type = (
+            content_type.encode("latin-1") if isinstance(content_type, str)
+            else content_type
+        )
+        # extra headers are bytes -> bytes, e.g. {b"Link": b"..."}.
         self.extra = extra or {}
 
 
 def json_response(status, value, extra=None):
-    return Response(status, json_bytes(value), JSON_TYPE, extra)
+    return Response(status, json_bytes(value), JSON_TYPE_B, extra)
 
 
 def error_response(status, message):
@@ -1174,6 +1270,53 @@ class _WorkerPoolServer(socketserver.TCPServer):
         super().server_close()
 
 
+class _BufferedSocket:
+    """A minimal buffered reader over a socket: one recv per fill, with
+    line/exact reads served from the buffer. A request head costs one find
+    plus one split here, instead of a BufferedReader.readline per line."""
+
+    __slots__ = ("sock", "buf")
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = bytearray()
+
+    def _fill(self, need=1):
+        while len(self.buf) < need:
+            try:
+                chunk = self.sock.recv(65536)
+            except (ConnectionError, OSError):
+                return False
+            if not chunk:
+                return False
+            self.buf += chunk
+        return True
+
+    def read_line(self):
+        """One line without its CRLF, or None on EOF before any byte."""
+        while True:
+            idx = self.buf.find(b"\n")
+            if idx >= 0:
+                line = bytes(self.buf[:idx])
+                del self.buf[:idx + 1]
+                return line[:-1] if line.endswith(b"\r") else line
+            if not self._fill():
+                if self.buf:
+                    line = bytes(self.buf)
+                    self.buf.clear()
+                    return line[:-1] if line.endswith(b"\r") else line
+                return None
+
+    def read_exact(self, count):
+        if count <= 0:
+            return b""
+        if not self._fill(count):
+            return None
+        out = bytes(self.buf[:count])
+        del self.buf[:count]
+        return out
+
+
 class HttpHandler(socketserver.BaseRequestHandler):
     """A small HTTP/1.1 loop: keep-alive, Content-Length and chunked bodies."""
 
@@ -1182,66 +1325,79 @@ class HttpHandler(socketserver.BaseRequestHandler):
             self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        rfile = self.request.makefile("rb")
+        reader = _BufferedSocket(self.request)
         try:
-            while self._one_request(rfile):
+            while self._one_request(reader):
                 pass
         except (ConnectionError, BrokenPipeError, OSError):
             pass
-        finally:
-            try:
-                rfile.close()
-            except OSError:
-                pass
 
-    def _readline(self, rfile):
-        line = rfile.readline(65537)
-        if not line:
-            return None
-        return line.rstrip(b"\r\n")
-
-    def _one_request(self, rfile):
-        line = self._readline(rfile)
-        if line is None:
+    def _one_request(self, reader):
+        if not reader._fill(1):
             return False
-        if line == b"":
+        if reader.buf.startswith(b"\r\n"):
+            del reader.buf[:2]
             return True  # a stray CRLF between requests
-        parts = line.split(b" ")
+        while True:
+            idx = reader.buf.find(b"\r\n\r\n")
+            if idx >= 0:
+                break
+            if not reader._fill():
+                return False
+        head = bytes(reader.buf[:idx])
+        del reader.buf[:idx + 4]
+        lines = head.split(b"\r\n")
+        if not lines or not lines[0]:
+            return True
+        parts = lines[0].split(b" ")
         if len(parts) < 2:
             return False
         method = parts[0].decode("latin-1").upper()
-        target = parts[1].decode("latin-1")
+        target = parts[1]
         version = parts[2].decode("latin-1") if len(parts) > 2 else "HTTP/1.1"
+        # Headers stay bytes -> bytes: no decode/strip/lower per header as
+        # str (that was ~12 small allocations per request). Callers read the
+        # few headers they need as bytes.
         headers = {}
-        while True:
-            header_line = self._readline(rfile)
-            if header_line is None:
-                return False
-            if header_line == b"":
-                break
+        for header_line in lines[1:]:
             name, _, value = header_line.partition(b":")
-            headers[name.decode("latin-1").strip().lower()] = value.decode("latin-1").strip()
+            headers[name.strip().lower()] = value.strip()
         body = b""
-        if "content-length" in headers or "chunked" in headers.get("transfer-encoding", ""):
-            if headers.get("expect", "").lower() == "100-continue":
+        length_hdr = headers.get(b"content-length")
+        transfer_encoding = headers.get(b"transfer-encoding", b"")
+        if length_hdr is not None or b"chunked" in transfer_encoding:
+            if headers.get(b"expect", b"").lower() == b"100-continue":
                 self.request.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
-            if "chunked" in headers.get("transfer-encoding", ""):
-                body = self._read_chunked(rfile)
+            if b"chunked" in transfer_encoding:
+                body = self._read_chunked(reader)
                 if body is None:
                     return False
             else:
                 try:
-                    length = int(headers.get("content-length", "0"))
+                    length = int(length_hdr)
                 except ValueError:
                     return False
                 if length > 0:
-                    body = rfile.read(length)
-                    if body is None or len(body) < length:
+                    body = reader.read_exact(length)
+                    if body is None:
                         return False
-        split = urlsplit(target)
-        path = unquote(split.path)
-        query = parse_qs(split.query, keep_blank_values=True) if split.query else {}
-        host = headers.get("host", "127.0.0.1")
+        # Fast target split: most requests carry no query string and no
+        # percent-escapes; urlsplit/parse_qs/unquote run only when needed.
+        if b"?" in target:
+            raw_path, _, raw_query = target.partition(b"?")
+            raw_query = raw_query.split(b"#", 1)[0]
+            query = parse_qs(raw_query.decode("latin-1"), keep_blank_values=True) if raw_query else {}
+        else:
+            raw_path, query = target, {}
+        if raw_path.startswith(b"http://") or raw_path.startswith(b"https://"):
+            # Absolute-form target: strip scheme and authority.
+            rest = raw_path.split(b"/", 3)
+            raw_path = b"/" + rest[3] if len(rest) > 3 else b"/"
+        if b"%" in raw_path:
+            path = unquote(raw_path.decode("latin-1"))
+        else:
+            path = raw_path.decode("latin-1")
+        host = headers.get(b"host", b"127.0.0.1").decode("latin-1")
         origin = "http://" + host
         request = Request(method, path, query, headers, body, origin)
         try:
@@ -1249,16 +1405,16 @@ class HttpHandler(socketserver.BaseRequestHandler):
         except Exception as error:  # a handler bug must not kill the connection loop silently
             sys.stderr.write("handler error: %r\n" % (error,))
             response = error_response(500, "Internal Server Error")
-        keep_alive = version == "HTTP/1.1" and headers.get("connection", "").lower() != "close"
-        if version == "HTTP/1.0" and headers.get("connection", "").lower() == "keep-alive":
+        keep_alive = version == "HTTP/1.1" and headers.get(b"connection", b"").lower() != b"close"
+        if version == "HTTP/1.0" and headers.get(b"connection", b"").lower() == b"keep-alive":
             keep_alive = True
         self._send(response, keep_alive)
         return keep_alive
 
-    def _read_chunked(self, rfile):
+    def _read_chunked(self, reader):
         chunks = []
         while True:
-            size_line = self._readline(rfile)
+            size_line = reader.read_line()
             if size_line is None:
                 return None
             try:
@@ -1268,28 +1424,30 @@ class HttpHandler(socketserver.BaseRequestHandler):
             if size == 0:
                 # trailers until the empty line
                 while True:
-                    trailer = self._readline(rfile)
+                    trailer = reader.read_line()
                     if trailer is None or trailer == b"":
                         break
                 return b"".join(chunks)
-            data = rfile.read(size)
-            if data is None or len(data) < size:
+            data = reader.read_exact(size)
+            if data is None:
                 return None
             chunks.append(data)
-            if self._readline(rfile) is None:
+            if reader.read_line() is None:
                 return None
 
     def _send(self, response, keep_alive):
-        head = ["HTTP/1.1 %d %s\r\n" % (response.status, STATUS_TEXT.get(response.status, ""))]
+        # The head is built as bytes throughout: no str join + latin-1
+        # encode per response, and one sendall for head + body.
+        head = [b"HTTP/1.1 %d %s\r\n" % (response.status, _STATUS_TEXT_B.get(response.status, b""))]
         if response.content_type is not None:
-            head.append("Content-Type: %s\r\n" % response.content_type)
-        head.append("Content-Length: %d\r\n" % len(response.body))
+            head.append(b"Content-Type: %s\r\n" % response.content_type)
+        head.append(b"Content-Length: %d\r\n" % len(response.body))
         for name, value in response.extra.items():
-            head.append("%s: %s\r\n" % (name, value))
+            head.append(name + b": " + value + b"\r\n")
         if not keep_alive:
-            head.append("Connection: close\r\n")
-        head.append("\r\n")
-        self.request.sendall("".join(head).encode("latin-1") + response.body)
+            head.append(b"Connection: close\r\n")
+        head.append(b"\r\n")
+        self.request.sendall(b"".join(head) + response.body)
 
 
 # --------------------------------------------------------------------------
@@ -1333,7 +1491,7 @@ def paginate(request, items):
     if page > 1:
         links.append('<%s>; rel="first"' % page_url(1))
         links.append('<%s>; rel="prev"' % page_url(page - 1))
-    extra = {"Link": ", ".join(links)} if links else None
+    extra = {b"Link": (", ".join(links)).encode("latin-1")} if links else None
     return chunk, extra
 
 
@@ -1353,7 +1511,7 @@ def rest_root(request):
         "current_user_url": request.origin + "/api/v3/user",
         "repository_url": request.origin + "/api/v3/repos/{owner}/{repo}",
         "rate_limit_url": request.origin + "/api/v3/rate_limit",
-    }, {"X-OAuth-Scopes": "repo, read:org"})
+    }, {b"X-OAuth-Scopes": b"repo, read:org"})
 
 
 def rest_meta(request):
@@ -1750,7 +1908,7 @@ def rest_create_issue(request, repo):
         return failure
     text = body.get("body")
     issue = create_issue_record(repo, title, text if isinstance(text, str) else "", label_names)
-    return json_response(201, issue_json(repo, issue, request.origin))
+    return Response(201, issue_json_bytes(repo, issue, request.origin), JSON_TYPE_B)
 
 
 def _issue_list_filtered(repo, query):
@@ -1778,9 +1936,9 @@ def rest_get_issue(request, repo, number):
     issue = repo.issues.get(number)
     if issue is None:
         return not_found()
-    body = json_bytes(issue_json(repo, issue, request.origin))
+    body = issue_json_bytes(repo, issue, request.origin)
     repo.issue_get_cache[number] = body
-    return Response(200, body, JSON_TYPE)
+    return Response(200, body, JSON_TYPE_B)
 
 
 def rest_patch_issue(request, repo, number):
@@ -2132,6 +2290,16 @@ UPLOAD_CAPS_V0 = (
 )
 RECEIVE_CAPS_V0 = "report-status delete-refs side-band-64k agent=forge-" + VERSION
 
+# The protocol-v2 advertisement carries no refs: one constant for all repos.
+_V2_ADVERTISEMENT = b"".join([
+    pkt_text("version 2\n"),
+    pkt_text("agent=forge-" + VERSION + "\n"),
+    pkt_text("ls-refs=unborn\n"),
+    pkt_text("fetch=shallow wait-for-done\n"),
+    pkt_text("object-format=sha1\n"),
+    PKT_FLUSH,
+])
+
 
 def _advertised_refs(repo):
     refs = dict(repo.refs)
@@ -2172,23 +2340,24 @@ def _ref_lines_v0(repo, caps):
 def git_info_refs(request, repo, service):
     if service not in ("git-upload-pack", "git-receive-pack"):
         return error_response(403, "unknown service")
-    protocol = request.headers.get("git-protocol", "")
-    if service == "git-upload-pack" and "version=2" in protocol:
-        body = b"".join([
-            pkt_text("version 2\n"),
-            pkt_text("agent=forge-" + VERSION + "\n"),
-            pkt_text("ls-refs=unborn\n"),
-            pkt_text("fetch=shallow wait-for-done\n"),
-            pkt_text("object-format=sha1\n"),
-            PKT_FLUSH,
-        ])
-        return Response(200, body, "application/x-git-upload-pack-advertisement")
+    protocol = request.headers.get(b"git-protocol", b"")
+    if service == "git-upload-pack" and b"version=2" in protocol:
+        # The v2 advertisement carries no refs: identical for every repo.
+        return Response(200, _V2_ADVERTISEMENT, _CT_UPLOAD_AD)
     caps = UPLOAD_CAPS_V0 if service == "git-upload-pack" else RECEIVE_CAPS_V0
     if service == "git-upload-pack":
         caps = caps + " symref=HEAD:refs/heads/" + repo.default_branch
+    # The v0 advertisement is a pure function of (refs, default_branch) on a
+    # fixed repo version; cache it per version (a clone burst asks for it
+    # twice per clone on an unchanging repo).
+    cache_key = (service, repo.version, repo.default_branch)
+    cached = repo.ad_cache.get(cache_key)
+    if cached is not None:
+        return Response(200, cached, _CT_UPLOAD_AD if service == "git-upload-pack" else _CT_RECEIVE_AD)
     preamble = pkt_text("# service=%s\n" % service) + PKT_FLUSH
     body = preamble + b"".join(_ref_lines_v0(repo, caps)) + PKT_FLUSH
-    return Response(200, body, "application/x-%s-advertisement" % service)
+    repo.ad_cache[cache_key] = body
+    return Response(200, body, _CT_UPLOAD_AD if service == "git-upload-pack" else _CT_RECEIVE_AD)
 
 
 def _ls_refs_response(repo, args):
@@ -2246,6 +2415,13 @@ def _fetch_response_v2(repo, args):
                 depth = int(arg[7:].strip())
             except ValueError:
                 depth = None
+    # The whole response is a pure function of the fetch key on a fixed repo
+    # version (bump() clears this cache on any git mutation), so a clone
+    # burst of 50 identical fetches builds it once.
+    key = (tuple(wants), tuple(haves), depth, tuple(shallow))
+    cached = repo.fetch_resp_cache.get(key)
+    if cached is not None:
+        return cached
     pack, shallow_lines, unshallow_lines = fetch_pack_bytes(repo, wants, haves, depth, shallow)
     out = [pkt_text("acknowledgments\n")]
     common = [have for have in haves if _have_is_common(repo, have, wants)]
@@ -2266,7 +2442,9 @@ def _fetch_response_v2(repo, args):
     out.append(pkt_text("packfile\n"))
     out.append(sideband_packets(pack))
     out.append(PKT_FLUSH)
-    return b"".join(out)
+    body = b"".join(out)
+    repo.fetch_resp_cache[key] = body
+    return body
 
 
 def _have_is_common(repo, have, wants):
@@ -2298,9 +2476,9 @@ def _fetch_response_v0(repo, wants, haves, depth, shallow):
 
 
 def git_upload_pack(request, repo):
-    protocol = request.headers.get("git-protocol", "")
+    protocol = request.headers.get(b"git-protocol", b"")
     body = request.body
-    if "version=2" in protocol:
+    if b"version=2" in protocol:
         packets, _rest = parse_pkt_lines(body)
         args = []
         command = None
@@ -2315,9 +2493,9 @@ def git_upload_pack(request, repo):
             else:
                 args.append(text)
         if command == "ls-refs":
-            return Response(200, _ls_refs_response(repo, args), "application/x-git-upload-pack-result")
+            return Response(200, _ls_refs_response(repo, args), _CT_UPLOAD_RESULT)
         if command == "fetch":
-            return Response(200, _fetch_response_v2(repo, args), "application/x-git-upload-pack-result")
+            return Response(200, _fetch_response_v2(repo, args), _CT_UPLOAD_RESULT)
         return error_response(400, "unknown command")
     # protocol v0: wants, flush, haves, done, flush
     wants = []
@@ -2360,7 +2538,7 @@ def git_upload_pack(request, repo):
             except ValueError:
                 depth = None
     return Response(200, _fetch_response_v0(repo, wants, haves, depth, shallow),
-                    "application/x-git-upload-pack-result")
+                    _CT_UPLOAD_RESULT)
 
 
 def git_receive_pack(request, repo):
@@ -2445,7 +2623,7 @@ def git_receive_pack(request, repo):
             report.append(pkt_text("ng %s %s\n" % (ref, reason)))
     report.append(PKT_FLUSH)
     stream = b"".join(report)
-    return Response(200, sideband_packets(stream), "application/x-git-receive-pack-result")
+    return Response(200, sideband_packets(stream), _CT_RECEIVE_RESULT)
 
 
 # --------------------------------------------------------------------------
@@ -2459,10 +2637,38 @@ def dispatch(request):
         return json_response(200, {"ok": True})
     if path.startswith("/api/"):
         response = dispatch_api(request)
-        response.extra.setdefault("X-GitHub-Request-Id", FORGE.next_request_id())
+        response.extra.setdefault(b"X-GitHub-Request-Id", FORGE.next_request_id())
         return response
     if path == "/mcp":
         return dispatch_mcp(request)
+    # Fast paths for the git smart-HTTP routes: parse owner/repo/tail
+    # directly instead of building the filtered segment list.
+    if method == "GET" and path.endswith("/info/refs"):
+        parts = path[1:-len("/info/refs")].split("/")
+        if len(parts) == 2:
+            owner = parts[0]
+            name = parts[1][:-4] if parts[1].endswith(".git") else parts[1]
+            repo = FORGE.get_repo(owner, name)
+            if repo is None:
+                return not_found()
+            if not request.authorized():
+                return error_response(401, "authentication required")
+            service = request.query.get("service", [""])[0]
+            return git_info_refs(request, repo, service)
+    if method == "POST" and (path.endswith("/git-upload-pack") or path.endswith("/git-receive-pack")):
+        service = "git-upload-pack" if path.endswith("/git-upload-pack") else "git-receive-pack"
+        parts = path[1:-len("/" + service)].split("/")
+        if len(parts) == 2:
+            owner = parts[0]
+            name = parts[1][:-4] if parts[1].endswith(".git") else parts[1]
+            repo = FORGE.get_repo(owner, name)
+            if repo is None:
+                return not_found()
+            if not request.authorized():
+                return error_response(401, "authentication required")
+            if service == "git-upload-pack":
+                return git_upload_pack(request, repo)
+            return git_receive_pack(request, repo)
     segments = [segment for segment in path.split("/") if segment != ""]
     if len(segments) >= 3:
         owner = segments[0]
@@ -2501,6 +2707,20 @@ def dispatch_api(request):
     if not request.authorized():
         return error_response(401, "Bad credentials")
     rest = path[len("/api/v3"):]
+    # Fast paths for the hot routes: GET/POST a single issue without
+    # building the filtered segment list.
+    if rest.startswith("/repos/"):
+        parts = rest[7:].split("/")
+        if len(parts) == 4 and parts[2] == "issues" and parts[3].isdigit() and method == "GET":
+            repo = require_repo(parts[0], parts[1])
+            if repo is None:
+                return not_found()
+            return rest_get_issue(request, repo, int(parts[3]))
+        if len(parts) == 3 and parts[2] == "issues" and method == "POST":
+            repo = require_repo(parts[0], parts[1])
+            if repo is None:
+                return not_found()
+            return rest_create_issue(request, repo)
     segments = [segment for segment in rest.split("/") if segment != ""]
     if not segments:
         if method == "GET":
@@ -3610,7 +3830,7 @@ def _wait_for_done(server):
 
 def main():
     port = 0
-    raw_port = os.environ.get("PORT", "")
+    raw_port = os.environ.get("PORT", "") or os.environ.get("FORGE_PORT", "")
     if raw_port.isdigit():
         port = int(raw_port)
     server = _WorkerPoolServer(("", port), HttpHandler)
