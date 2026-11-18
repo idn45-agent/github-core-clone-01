@@ -246,7 +246,7 @@ class Repo:
         "tree_closure_cache", "flat_cache", "issues", "pulls", "labels",
         "comments", "next_number", "next_comment_id", "version",
         "pack_cache", "pack_lock", "issue_get_cache", "ad_cache",
-        "fetch_resp_cache",
+        "fetch_resp_cache", "lsrefs_cache",
     )
 
     def __init__(self, repo_id, owner, name, description, private, created_ts):
@@ -275,6 +275,7 @@ class Repo:
         self.issue_get_cache = {}    # number -> response body bytes
         self.ad_cache = {}           # (service, version, default_branch) -> ad bytes
         self.fetch_resp_cache = {}   # fetch key -> full v2 response bytes
+        self.lsrefs_cache = {}       # ls-refs args tuple -> response bytes
 
     @property
     def full_name(self):
@@ -288,6 +289,7 @@ class Repo:
         self.pack_cache.clear()
         self.ad_cache.clear()
         self.fetch_resp_cache.clear()
+        self.lsrefs_cache.clear()
 
     # -- objects -----------------------------------------------------------
 
@@ -1234,7 +1236,7 @@ class _WorkerPoolServer(socketserver.TCPServer):
     request_queue_size = 512
     daemon_threads = True
 
-    def __init__(self, server_address, handler_class, workers=96):
+    def __init__(self, server_address, handler_class, workers=192):
         self._queue = queue.Queue()
         self._worker_count = workers
         self._workers_started = False
@@ -1317,12 +1319,84 @@ class _BufferedSocket:
         return out
 
 
+_WS_BYTES = (b" ", b"\t", b"\r", b"\n", b"\x0b", b"\x0c")
+_ISSUES_PREFIX = b"/api/v3/repos/"
+_ERR_NOT_FOUND_B = b'{"message":"Not Found"}'
+_ERR_BAD_CREDENTIALS_B = b'{"message":"Bad credentials"}'
+_ERR_INVALID_BODY_B = b'{"message":"Invalid request body"}'
+_ERR_TITLE_REQUIRED_B = b'{"message":"Validation Failed: title is required"}'
+
+
+def _fast_issue_route(method, target, headers, body):
+    """(status, body) for GET/POST /api/v3/repos/{o}/{r}/issues[/{n}],
+    or None when the request is not exactly one of those two routes.
+
+    Mirrors dispatch -> dispatch_api -> rest_get_issue /
+    rest_create_issue step for step: the auth check sits before the
+    repo lookup, the error bodies are the generic ones, and the caller
+    adds the same request-id header every /api/ response carries."""
+    if not target.startswith(_ISSUES_PREFIX):
+        return None
+    parts = target[len(_ISSUES_PREFIX):].split(b"/")
+    if len(parts) == 4 and method == b"GET" and parts[2] == b"issues":
+        number_raw = parts[3]
+        if not number_raw.isdigit() or len(number_raw) > 18:
+            return None
+        is_get = True
+    elif len(parts) == 3 and method == b"POST" and parts[2] == b"issues":
+        is_get = False
+    else:
+        return None
+    try:
+        owner = parts[0].decode("ascii")
+        name = parts[1].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if TOKEN and headers.get(b"authorization") != _AUTH_HEADER:
+        return 401, _ERR_BAD_CREDENTIALS_B
+    repo = FORGE.get_repo(owner, name)
+    if repo is None:
+        return 404, _ERR_NOT_FOUND_B
+    host = headers.get(b"host", b"127.0.0.1").decode("latin-1")
+    origin = "http://" + host
+    if is_get:
+        number = int(number_raw)
+        cached = repo.issue_get_cache.get(number)
+        if cached is not None:
+            return 200, cached
+        issue = repo.issues.get(number)
+        if issue is None:
+            return 404, _ERR_NOT_FOUND_B
+        payload = issue_json_bytes(repo, issue, origin)
+        repo.issue_get_cache[number] = payload
+        return 200, payload
+    data = parse_json_body(body)
+    if not isinstance(data, dict):
+        return 400, _ERR_INVALID_BODY_B
+    title = data.get("title")
+    if not isinstance(title, str) or not title:
+        return 422, _ERR_TITLE_REQUIRED_B
+    label_names, failure = _label_names_or_error(repo, data)
+    if failure is not None:
+        return failure.status, failure.body
+    text = data.get("body")
+    issue = create_issue_record(repo, title, text if isinstance(text, str) else "", label_names)
+    return 201, issue_json_bytes(repo, issue, origin)
+
+
 class HttpHandler(socketserver.BaseRequestHandler):
     """A small HTTP/1.1 loop: keep-alive, Content-Length and chunked bodies."""
 
     def handle(self):
         try:
             self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # An idle keep-alive connection must not pin its worker
+            # forever: a clone burst opens more connections than there
+            # are workers, and the queued ones only move when a worker
+            # recycles. Two idle seconds end the connection (the client
+            # reopens transparently); in-flight requests are unaffected
+            # because the timeout only bites when no bytes arrive.
+            self.request.settimeout(2.0)
         except OSError:
             pass
         reader = _BufferedSocket(self.request)
@@ -1361,7 +1435,14 @@ class HttpHandler(socketserver.BaseRequestHandler):
         headers = {}
         for header_line in lines[1:]:
             name, _, value = header_line.partition(b":")
-            headers[name.strip().lower()] = value.strip()
+            # strip() runs only when an edge byte is whitespace (real
+            # clients pad neither): two strips per header were a visible
+            # slice of the per-request cost.
+            if name[:1] in _WS_BYTES or name[-1:] in _WS_BYTES:
+                name = name.strip()
+            if value[:1] in _WS_BYTES or value[-1:] in _WS_BYTES:
+                value = value.strip()
+            headers[name.lower()] = value
         body = b""
         length_hdr = headers.get(b"content-length")
         transfer_encoding = headers.get(b"transfer-encoding", b"")
@@ -1381,6 +1462,27 @@ class HttpHandler(socketserver.BaseRequestHandler):
                     body = reader.read_exact(length)
                     if body is None:
                         return False
+        # Bench-hot routes: GET/POST one issue, answered from the raw
+        # head — no target decode, no Request, no dispatch layers. The
+        # response bytes (status line, content type, request-id header,
+        # connection handling) match the generic path exactly; anything
+        # unusual (query string, escapes) falls through to it.
+        if b"?" not in target and b"%" not in target:
+            fast = _fast_issue_route(parts[0].upper(), target, headers, body)
+            if fast is not None:
+                status, payload = fast
+                keep_alive = version == "HTTP/1.1" and headers.get(b"connection", b"").lower() != b"close"
+                if version == "HTTP/1.0" and headers.get(b"connection", b"").lower() == b"keep-alive":
+                    keep_alive = True
+                head = [b"HTTP/1.1 %d %s\r\n" % (status, _STATUS_TEXT_B.get(status, b"")),
+                        b"Content-Type: " + JSON_TYPE_B + b"\r\n",
+                        b"Content-Length: %d\r\n" % len(payload),
+                        b"X-GitHub-Request-Id: " + FORGE.next_request_id() + b"\r\n"]
+                if not keep_alive:
+                    head.append(b"Connection: close\r\n")
+                head.append(b"\r\n")
+                self.request.sendall(b"".join(head) + payload)
+                return keep_alive
         # Fast target split: most requests carry no query string and no
         # percent-escapes; urlsplit/parse_qs/unquote run only when needed.
         if b"?" in target:
@@ -2361,6 +2463,19 @@ def git_info_refs(request, repo, service):
 
 
 def _ls_refs_response(repo, args):
+    # The response is a pure function of (refs, args) on a fixed repo
+    # version (bump() clears this cache on any git mutation), and a clone
+    # burst repeats the identical request dozens of times.
+    key = tuple(args)
+    cached = repo.lsrefs_cache.get(key)
+    if cached is not None:
+        return cached
+    body = _ls_refs_response_build(repo, args)
+    repo.lsrefs_cache[key] = body
+    return body
+
+
+def _ls_refs_response_build(repo, args):
     prefixes = [arg[len("ref-prefix "):] for arg in args if arg.startswith("ref-prefix ")]
     want_peel = "peel" in args
     want_symrefs = "symrefs" in args
